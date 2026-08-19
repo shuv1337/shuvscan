@@ -1,4 +1,7 @@
 use std::{
+    num::NonZeroUsize,
+    panic::{self, AssertUnwindSafe},
+    sync::atomic::{AtomicUsize, Ordering},
     thread,
     time::{Duration, Instant},
 };
@@ -10,6 +13,7 @@ use crate::{
 };
 
 const EVIDENCE_LIMIT: usize = 8 * 1024;
+pub const DEFAULT_CONCURRENCY: usize = 16;
 
 /// Scan one target: a single transport session collects every probe, then each
 /// section is evaluated independently. A probe with no parseable section, a
@@ -99,23 +103,97 @@ pub fn scan(target: Target, timeout: Duration, sudo: bool) -> ScanReport {
     }
 }
 
-pub fn scan_all(targets: Vec<Target>, timeout: Duration, sudo: bool) -> Vec<ScanReport> {
+pub fn scan_all(
+    targets: Vec<Target>,
+    timeout: Duration,
+    sudo: bool,
+    concurrency: NonZeroUsize,
+) -> Vec<ScanReport> {
+    scan_all_with(targets, concurrency, |target| scan(target, timeout, sudo))
+}
+
+fn scan_all_with<F>(
+    targets: Vec<Target>,
+    concurrency: NonZeroUsize,
+    scan_target: F,
+) -> Vec<ScanReport>
+where
+    F: Fn(Target) -> ScanReport + Sync,
+{
+    let next = AtomicUsize::new(0);
+    let worker_count = concurrency.get().min(targets.len());
     let mut reports = thread::scope(|scope| {
-        targets
+        let handles = (0..worker_count)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut reports = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(target) = targets.get(index).cloned() else {
+                            break;
+                        };
+                        let label = target.label().to_owned();
+                        let started = Instant::now();
+                        reports.push((
+                            index,
+                            panic::catch_unwind(AssertUnwindSafe(|| scan_target(target)))
+                                .unwrap_or_else(|_| panicked_report(label, started.elapsed())),
+                        ));
+                    }
+                    reports
+                })
+            })
+            .collect::<Vec<_>>();
+
+        handles
             .into_iter()
-            .map(|target| scope.spawn(move || scan(target, timeout, sudo)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|handle| handle.join().expect("scan worker panicked"))
+            .flat_map(|handle| handle.join().expect("scheduler worker panicked"))
             .collect::<Vec<_>>()
     });
-    reports.sort_by(|left, right| left.target.cmp(&right.target));
-    reports
+    reports.sort_by(|(left_index, left), (right_index, right)| {
+        left.target
+            .cmp(&right.target)
+            .then(left_index.cmp(right_index))
+    });
+    reports.into_iter().map(|(_, report)| report).collect()
+}
+
+fn panicked_report(target: String, duration: Duration) -> ScanReport {
+    ScanReport {
+        schema_version: 1,
+        scanner_version: env!("CARGO_PKG_VERSION"),
+        target,
+        host: None,
+        duration_ms: duration.as_millis(),
+        probes_run: BUILTINS.len(),
+        findings: Vec::new(),
+        errors: vec![ScanError {
+            probe: "collector",
+            message: "scan worker panicked".into(),
+        }],
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    fn report(target: String) -> ScanReport {
+        ScanReport {
+            schema_version: 1,
+            scanner_version: env!("CARGO_PKG_VERSION"),
+            target,
+            host: None,
+            duration_ms: 0,
+            probes_run: BUILTINS.len(),
+            findings: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
 
     #[test]
     fn local_scan_collects_every_probe_in_one_session() {
@@ -135,5 +213,82 @@ mod tests {
             "every probe should produce a section: {:?}",
             report.errors
         );
+    }
+
+    #[test]
+    fn fleet_scheduler_bounds_concurrency_and_sorts_reports() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let targets = (0..12)
+            .rev()
+            .map(|index| Target::Ssh(format!("host-{index:02}")))
+            .collect();
+
+        let reports = scan_all_with(targets, NonZeroUsize::new(3).unwrap(), {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            move |target| {
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(now, Ordering::SeqCst);
+                let delay = target
+                    .label()
+                    .rsplit_once('-')
+                    .unwrap()
+                    .1
+                    .parse::<u64>()
+                    .unwrap();
+                thread::sleep(Duration::from_millis(delay));
+                active.fetch_sub(1, Ordering::SeqCst);
+                report(target.label().to_owned())
+            }
+        });
+
+        assert_eq!(reports.len(), 12);
+        assert_eq!(maximum.load(Ordering::SeqCst), 3);
+        assert!(
+            reports
+                .windows(2)
+                .all(|pair| pair[0].target < pair[1].target)
+        );
+    }
+
+    #[test]
+    fn failed_and_panicked_scans_do_not_stop_queue() {
+        let targets = ["good-b", "failure", "panic", "good-a"]
+            .into_iter()
+            .map(|target| Target::Ssh(target.into()))
+            .collect();
+
+        let reports = scan_all_with(targets, NonZeroUsize::new(1).unwrap(), |target| {
+            assert_ne!(target.label(), "panic", "simulated scan panic");
+            let mut report = report(target.label().to_owned());
+            if target.label() == "failure" {
+                report.errors.push(ScanError {
+                    probe: "collector",
+                    message: "simulated transport failure".into(),
+                });
+            }
+            report
+        });
+
+        assert_eq!(reports.len(), 4);
+        assert_eq!(reports[0].target, "failure");
+        assert_eq!(reports[0].errors[0].message, "simulated transport failure");
+        assert_eq!(reports[1].target, "good-a");
+        assert_eq!(reports[2].target, "good-b");
+        assert_eq!(reports[3].target, "panic");
+        assert_eq!(reports[3].errors[0].probe, "collector");
+    }
+
+    #[test]
+    fn fleet_scheduler_handles_empty_and_single_target_inputs() {
+        let concurrency = NonZeroUsize::new(4).unwrap();
+        assert!(scan_all_with(Vec::new(), concurrency, |_| unreachable!()).is_empty());
+
+        let reports = scan_all_with(vec![Target::Local], concurrency, |target| {
+            report(target.label().to_owned())
+        });
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].target, "local");
     }
 }

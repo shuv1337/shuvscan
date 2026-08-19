@@ -1,4 +1,4 @@
-use std::{io, process::ExitCode, time::Duration};
+use std::{io, num::NonZeroUsize, process::ExitCode, time::Duration};
 
 use clap::{Parser, ValueEnum};
 use shuvscan::{
@@ -36,6 +36,10 @@ struct Cli {
     #[arg(long, default_value_t = 60, value_name = "SECONDS")]
     timeout: u64,
 
+    /// Maximum number of targets scanned concurrently.
+    #[arg(long, default_value_t = NonZeroUsize::new(engine::DEFAULT_CONCURRENCY).unwrap(), value_name = "COUNT")]
+    concurrency: NonZeroUsize,
+
     /// Return exit 2 if any probe could not be collected.
     #[arg(long)]
     strict_collection: bool,
@@ -64,7 +68,12 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let reports = engine::scan_all(cli.target, Duration::from_secs(cli.timeout), cli.sudo);
+    let reports = engine::scan_all(
+        cli.target,
+        Duration::from_secs(cli.timeout),
+        cli.sudo,
+        cli.concurrency,
+    );
     let stdout = io::stdout();
     let result = match cli.format {
         Format::Human => output::human(&reports, stdout.lock()),

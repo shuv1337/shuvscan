@@ -41,6 +41,7 @@ cargo build --release
 ./target/release/shuvscan \
   --target root@web-01 \
   --target ops@db-01 \
+  --concurrency 8 \
   --format json
 
 # Treat incomplete collection as an operational failure.
@@ -57,6 +58,9 @@ host-key checking enabled.
 `--sudo` runs only the built-in, read-only collector through `sudo -n -- sh -s`.
 It never prompts, accepts a password, or falls back silently; sudo policy or authentication
 failures are reported as collection errors.
+
+Fleet scans run at most 16 targets concurrently by default. Set
+`--concurrency <COUNT>` to tune that bound; zero is rejected.
 
 ## Collection model
 
@@ -101,8 +105,7 @@ The pack is intentionally small and inspectable (`shuvscan --list-probes`):
   policy permits the reviewed collector.
 - `/proc/<pid>/exe` links of other users' processes are only readable by root,
   so unprivileged `SHUV-PROC-001` results are explicitly marked partial.
-- One thread per `--target`; a bounded scheduler is on the roadmap before
-  large-fleet use.
+- Scheduling is in-memory and non-resumable; resumable fleet scans are planned.
 
 ## Architecture
 

@@ -9,8 +9,26 @@ fn help_describes_agentless_targets() {
         .assert()
         .success()
         .stdout(predicate::str::contains("OpenSSH destination"))
+        .stdout(predicate::str::contains("--concurrency"))
         .stdout(predicate::str::contains("--sudo"))
         .stdout(predicate::str::contains("sudo -n"));
+}
+
+#[test]
+fn invalid_concurrency_is_rejected() {
+    Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args(["--concurrency", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value '0'"));
+
+    Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args(["--concurrency", "many"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("invalid value 'many'"));
 }
 
 #[test]
