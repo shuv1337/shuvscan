@@ -9,7 +9,7 @@
 - [x] Capability inventory (root, available tools) driving probe selection
 - [x] Bounded fleet scheduler with concurrency limits
 - [x] Fixture-backed evaluators across major distributions
-- [ ] SARIF and OCSF exports
+- [x] SARIF and OCSF exports
 
 ## Phase 2: Detection engine
 

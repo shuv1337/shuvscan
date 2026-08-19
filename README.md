@@ -25,7 +25,7 @@ or settle for a shallow configuration checklist. Shuvscan's goal is a third opti
   collection failures.
 - **Fleet-native.** Parallel targets, deterministic reports, baselines, drift, and eventually a
   local-first evidence graph.
-- **Automation-native.** Human output for terminals; JSON and NDJSON for everything else.
+- **Automation-native.** Human output for terminals; JSON, NDJSON, SARIF, and OCSF for integrations.
 - **Safe defaults.** Read-only probes, strict host-key checking, batch-mode SSH, no curl-pipe-shell
   installer, and no hidden telemetry.
 
@@ -61,6 +61,14 @@ failures are reported as collection errors.
 
 Fleet scans run at most 16 targets concurrently by default. Set
 `--concurrency <COUNT>` to tune that bound; zero is rejected.
+
+`--format sarif` emits one SARIF 2.1.0 run. Findings use host logical
+locations, and collection errors are tool execution notifications. `--format
+ocsf` emits an OCSF 1.8.0 JSON array containing one Scan Activity per target
+and one Detection Finding per finding. OCSF requires an event timestamp, so
+`time` records export time until the native report schema carries scan wall-clock
+time. Use the native `json` or `jsonl` formats when the complete Shuvscan report
+schema is required.
 
 ## Collection model
 
@@ -113,7 +121,7 @@ The pack is intentionally small and inspectable (`shuvscan --list-probes`):
 CLI / future TUI
       |
       v
-scan engine ---- stable report schema ---- human | JSON | NDJSON
+scan engine ---- stable report schema ---- human | JSON | NDJSON | SARIF | OCSF
       |
       v
 probe pack ---- evaluator ---- finding + bounded evidence

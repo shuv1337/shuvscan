@@ -62,3 +62,31 @@ fn json_output_includes_capability_inventory() {
         .stdout(predicate::str::contains("\"capabilities\""))
         .stdout(predicate::str::contains("\"tools\""));
 }
+
+#[test]
+fn sarif_output_is_parseable_and_versioned() {
+    let assert = Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args(["--format", "sarif", "--fail-on", "critical"])
+        .assert()
+        .code(predicate::eq(0).or(predicate::eq(1)));
+    let output: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+
+    assert_eq!(output["version"], "2.1.0");
+    assert_eq!(output["runs"][0]["tool"]["driver"]["name"], "shuvscan");
+}
+
+#[test]
+fn ocsf_output_is_parseable_and_versioned() {
+    let assert = Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args(["--format", "ocsf", "--fail-on", "critical"])
+        .assert()
+        .code(predicate::eq(0).or(predicate::eq(1)));
+    let output: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    let events = output.as_array().unwrap();
+
+    assert!(!events.is_empty());
+    assert_eq!(events[0]["class_uid"], 6007);
+    assert_eq!(events[0]["metadata"]["version"], "1.8.0");
+}

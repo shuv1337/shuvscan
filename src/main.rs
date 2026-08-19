@@ -13,6 +13,8 @@ enum Format {
     Human,
     Json,
     Jsonl,
+    Sarif,
+    Ocsf,
 }
 
 /// Exit codes: 0 clean, 1 findings at or above --fail-on,
@@ -79,6 +81,8 @@ fn main() -> ExitCode {
         Format::Human => output::human(&reports, stdout.lock()),
         Format::Json => output::json(&reports, stdout.lock()),
         Format::Jsonl => output::jsonl(&reports, stdout.lock()),
+        Format::Sarif => output::sarif(&reports, stdout.lock()),
+        Format::Ocsf => output::ocsf(&reports, stdout.lock()),
     };
     if let Err(error) = result {
         // A consumer closing the pipe early (`shuvscan | head`) is not a
