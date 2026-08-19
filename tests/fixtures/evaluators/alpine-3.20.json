@@ -1,0 +1,18 @@
+{
+  "distro": "alpine-3.20",
+  "cases": [
+    { "probe": "SHUV-AUTH-001", "non_finding": "", "finding": "rescue:/root:/bin/ash\n" },
+    { "probe": "SHUV-AUTH-002", "non_finding": "", "finding": "permitrootlogin yes\n" },
+    { "probe": "SHUV-AUTH-003", "non_finding": "", "finding": "passwordauthentication yes\n" },
+    { "probe": "SHUV-PERSIST-002", "non_finding": "", "finding": "/var/spool/cron/crontabs/root\n" },
+    { "probe": "SHUV-FS-002", "non_finding": "", "finding": "/dev/shm/trace\n" },
+    { "probe": "SHUV-PROC-001", "non_finding": "", "finding": "413 /usr/sbin/crond (deleted)\n" },
+    { "probe": "SHUV-KERN-001", "non_finding": "1\n", "finding": "0\n" },
+    { "probe": "SHUV-KERN-002", "non_finding": "2\n", "finding": "0\n" },
+    { "probe": "SHUV-EXEC-001", "non_finding": "", "finding": "/sbin\n" }
+  ],
+  "omitted": [
+    { "probe": "SHUV-PERSIST-001", "reason": "Alpine uses musl, which does not load /etc/ld.so.preload." },
+    { "probe": "SHUV-FS-001", "reason": "Alpine's default init system is OpenRC, not systemd." }
+  ]
+}

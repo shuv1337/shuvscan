@@ -1,0 +1,16 @@
+{
+  "distro": "rhel-9",
+  "cases": [
+    { "probe": "SHUV-AUTH-001", "non_finding": "", "finding": "operator:/root:/bin/bash\n" },
+    { "probe": "SHUV-AUTH-002", "non_finding": "", "finding": "permitrootlogin yes\n" },
+    { "probe": "SHUV-AUTH-003", "non_finding": "", "finding": "passwordauthentication yes\n" },
+    { "probe": "SHUV-PERSIST-001", "non_finding": "", "finding": "/usr/lib64/libwatch.so\n" },
+    { "probe": "SHUV-PERSIST-002", "non_finding": "", "finding": "/var/spool/cron/root\n" },
+    { "probe": "SHUV-FS-001", "non_finding": "", "finding": "/usr/lib/systemd/system/watch.service\n" },
+    { "probe": "SHUV-FS-002", "non_finding": "", "finding": "/tmp/watchd\n" },
+    { "probe": "SHUV-PROC-001", "non_finding": "", "finding": "722 /usr/libexec/platform-python (deleted)\n" },
+    { "probe": "SHUV-KERN-001", "non_finding": "2", "finding": "0" },
+    { "probe": "SHUV-KERN-002", "non_finding": "1", "finding": "0" },
+    { "probe": "SHUV-EXEC-001", "non_finding": "", "finding": "/usr/sbin\n" }
+  ]
+}

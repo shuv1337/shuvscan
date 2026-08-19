@@ -1,0 +1,16 @@
+{
+  "distro": "debian-12",
+  "cases": [
+    { "probe": "SHUV-AUTH-001", "non_finding": "", "finding": "maintenance:/root:/bin/bash\n" },
+    { "probe": "SHUV-AUTH-002", "non_finding": "", "finding": "permitrootlogin yes\n" },
+    { "probe": "SHUV-AUTH-003", "non_finding": "", "finding": "passwordauthentication yes\n" },
+    { "probe": "SHUV-PERSIST-001", "non_finding": "", "finding": "/usr/lib/x86_64-linux-gnu/libaudit.so\n" },
+    { "probe": "SHUV-PERSIST-002", "non_finding": "", "finding": "/etc/cron.d/maintenance\n" },
+    { "probe": "SHUV-FS-001", "non_finding": "", "finding": "/lib/systemd/system/maintenance.service\n" },
+    { "probe": "SHUV-FS-002", "non_finding": "", "finding": "/var/tmp/diagnostic\n" },
+    { "probe": "SHUV-PROC-001", "non_finding": "", "finding": "1842 /usr/bin/worker (deleted)\n" },
+    { "probe": "SHUV-KERN-001", "non_finding": "2\n", "finding": "0\n" },
+    { "probe": "SHUV-KERN-002", "non_finding": "2\n", "finding": "0\n" },
+    { "probe": "SHUV-EXEC-001", "non_finding": "", "finding": "/usr/local/bin\n" }
+  ]
+}

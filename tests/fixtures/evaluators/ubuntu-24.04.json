@@ -1,0 +1,16 @@
+{
+  "distro": "ubuntu-24.04",
+  "cases": [
+    { "probe": "SHUV-AUTH-001", "non_finding": "\n", "finding": "support:/home/support:/bin/bash\n" },
+    { "probe": "SHUV-AUTH-002", "non_finding": "\n", "finding": "permitrootlogin yes\n" },
+    { "probe": "SHUV-AUTH-003", "non_finding": "\n", "finding": "passwordauthentication yes\n" },
+    { "probe": "SHUV-PERSIST-001", "non_finding": "\n", "finding": "/usr/lib/x86_64-linux-gnu/libmonitor.so\n" },
+    { "probe": "SHUV-PERSIST-002", "non_finding": "\n", "finding": "/etc/cron.daily/telemetry\n" },
+    { "probe": "SHUV-FS-001", "non_finding": "\n", "finding": "/usr/lib/systemd/system/telemetry.service\n" },
+    { "probe": "SHUV-FS-002", "non_finding": "\n", "finding": "/dev/shm/helper\n" },
+    { "probe": "SHUV-PROC-001", "non_finding": "\n", "finding": "991 /snap/agent/current/agent (deleted)\n" },
+    { "probe": "SHUV-KERN-001", "non_finding": "1\n", "finding": " 0 \n" },
+    { "probe": "SHUV-KERN-002", "non_finding": "1\n", "finding": " 0 \n" },
+    { "probe": "SHUV-EXEC-001", "non_finding": "\n", "finding": "/usr/local/sbin\n" }
+  ]
+}

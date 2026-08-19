@@ -8,7 +8,7 @@
 - [x] Explicit "evidence unavailable" signal instead of silent passes
 - [x] Capability inventory (root, available tools) driving probe selection
 - [x] Bounded fleet scheduler with concurrency limits
-- [ ] Fixture-backed evaluators across major distributions
+- [x] Fixture-backed evaluators across major distributions
 - [ ] SARIF and OCSF exports
 
 ## Phase 2: Detection engine
