@@ -12,6 +12,17 @@ fn help_describes_agentless_targets() {
 }
 
 #[test]
+fn list_probes_prints_stable_ids_without_scanning() {
+    Command::cargo_bin("shuvscan")
+        .unwrap()
+        .arg("--list-probes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SHUV-PERSIST-001"))
+        .stdout(predicate::str::contains("SHUV-PROC-001"));
+}
+
+#[test]
 fn json_output_has_versioned_schema() {
     Command::cargo_bin("shuvscan")
         .unwrap()

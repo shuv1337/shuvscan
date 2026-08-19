@@ -65,6 +65,13 @@ impl FromStr for Target {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct HostInfo {
+    pub hostname: String,
+    pub kernel: String,
+    pub os: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct Evidence {
     pub command: &'static str,
     pub output: String,
@@ -92,6 +99,7 @@ pub struct ScanReport {
     pub schema_version: u8,
     pub scanner_version: &'static str,
     pub target: String,
+    pub host: Option<HostInfo>,
     pub duration_ms: u128,
     pub probes_run: usize,
     pub findings: Vec<Finding>,
@@ -101,5 +109,44 @@ pub struct ScanReport {
 impl ScanReport {
     pub fn highest_severity(&self) -> Option<Severity> {
         self.findings.iter().map(|finding| finding.severity).max()
+    }
+}
+
+/// Truncate collected evidence to at most `limit` bytes without ever splitting
+/// a UTF-8 code point (`String::truncate` panics on a non-boundary index).
+pub fn truncate_evidence(mut value: String, limit: usize) -> String {
+    if value.len() <= limit {
+        return value;
+    }
+    let mut cut = limit;
+    while cut > 0 && !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    value.truncate(cut);
+    value.push_str("\n[truncated]");
+    value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncation_respects_utf8_boundaries() {
+        let truncated = truncate_evidence("é".repeat(10), 3);
+        assert!(truncated.starts_with('é'));
+        assert!(truncated.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn truncation_leaves_short_values_untouched() {
+        assert_eq!(truncate_evidence("ok".into(), 16), "ok");
+    }
+
+    #[test]
+    fn severity_orders_low_to_critical() {
+        assert!(Severity::Critical > Severity::High);
+        assert!(Severity::High > Severity::Medium);
+        assert!(Severity::Info < Severity::Low);
     }
 }

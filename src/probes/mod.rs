@@ -1,5 +1,12 @@
 use crate::model::{Evidence, Finding, Severity};
 
+/// One read-only check. `script` is a static POSIX `sh` fragment executed in a
+/// subshell on the target; it must exit 0 whenever collection itself succeeded
+/// (a non-zero status is reported as a collection error, never as a pass), and
+/// it prints the `__SHUVSCAN_UNAVAILABLE__` sentinel when it can tell that the
+/// evidence cannot be gathered in the current context (for example without
+/// root). `evaluate` inspects stdout only and decides whether to raise a
+/// finding.
 pub struct Probe {
     pub id: &'static str,
     pub title: &'static str,
@@ -32,8 +39,8 @@ fn has_output(output: &str) -> bool {
     !output.trim().is_empty()
 }
 
-fn nonzero(output: &str) -> bool {
-    output.trim().parse::<u64>().is_ok_and(|value| value != 0)
+fn is_zero(output: &str) -> bool {
+    output.trim() == "0"
 }
 
 pub static BUILTINS: &[Probe] = &[
@@ -54,7 +61,13 @@ pub static BUILTINS: &[Probe] = &[
         category: "ssh",
         description: "The effective SSH daemon configuration permits direct root authentication.",
         remediation: "Set PermitRootLogin no, validate with sshd -T, and reload sshd.",
-        script: "if command -v sshd >/dev/null 2>&1; then sshd -T 2>/dev/null | awk '$1 == \"permitrootlogin\" && $2 == \"yes\"'; fi",
+        script: r#"if command -v sshd >/dev/null 2>&1; then
+  if cfg=$(sshd -T 2>/dev/null); then
+    printf '%s\n' "$cfg" | awk '$1 == "permitrootlogin" && $2 == "yes"'
+  else
+    printf '__SHUVSCAN_UNAVAILABLE__ sshd -T failed (usually requires root)\n'
+  fi
+fi"#,
         evaluate: has_output,
     },
     Probe {
@@ -64,7 +77,13 @@ pub static BUILTINS: &[Probe] = &[
         category: "ssh",
         description: "The SSH daemon accepts password authentication, increasing credential attack exposure.",
         remediation: "Deploy tested key-based access, then set PasswordAuthentication no.",
-        script: "if command -v sshd >/dev/null 2>&1; then sshd -T 2>/dev/null | awk '$1 == \"passwordauthentication\" && $2 == \"yes\"'; fi",
+        script: r#"if command -v sshd >/dev/null 2>&1; then
+  if cfg=$(sshd -T 2>/dev/null); then
+    printf '%s\n' "$cfg" | awk '$1 == "passwordauthentication" && $2 == "yes"'
+  else
+    printf '__SHUVSCAN_UNAVAILABLE__ sshd -T failed (usually requires root)\n'
+  fi
+fi"#,
         evaluate: has_output,
     },
     Probe {
@@ -78,13 +97,61 @@ pub static BUILTINS: &[Probe] = &[
         evaluate: has_output,
     },
     Probe {
+        id: "SHUV-PERSIST-002",
+        title: "World-writable cron entry",
+        severity: Severity::High,
+        category: "persistence",
+        description: "A cron file or directory can be modified by any local user, allowing scheduled code execution as root.",
+        remediation: "Restore root:root ownership and strict permissions, then audit the entries for planted jobs.",
+        script: r#"for d in /etc/crontab /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /var/spool/cron; do
+  [ -e "$d" ] && find "$d" -xdev -perm -0002 \( -type f -o -type d \) -print 2>/dev/null
+done
+:"#,
+        evaluate: has_output,
+    },
+    Probe {
         id: "SHUV-FS-001",
         title: "World-writable systemd unit",
         severity: Severity::Critical,
         category: "persistence",
         description: "A system service definition can be modified by any local user.",
         remediation: "Restore package-owned permissions and inspect the unit and its recent changes.",
-        script: "find /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system -xdev -type f -perm -0002 -print 2>/dev/null",
+        script: r#"for d in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+  [ -d "$d" ] && ! [ -L "$d" ] && find "$d" -xdev -type f -perm -0002 -print 2>/dev/null
+done
+:"#,
+        evaluate: has_output,
+    },
+    Probe {
+        id: "SHUV-FS-002",
+        title: "SUID/SGID binary in a temporary directory",
+        severity: Severity::Critical,
+        category: "filesystem",
+        description: "A set-uid or set-gid executable exists in a world-writable temporary directory; no legitimate software installs there.",
+        remediation: "Capture the binary for analysis, remove it, and hunt for the process or account that created it.",
+        script: r#"for d in /tmp /var/tmp /dev/shm; do
+  [ -d "$d" ] && find "$d" -xdev \( -perm -4000 -o -perm -2000 \) -type f -print 2>/dev/null
+done
+:"#,
+        evaluate: has_output,
+    },
+    Probe {
+        id: "SHUV-PROC-001",
+        title: "Process running a deleted executable",
+        severity: Severity::Medium,
+        category: "process",
+        description: "A running process executes a binary that no longer exists on disk. Malware deletes itself to evade file scans; package upgrades that replaced the binary are the common benign cause.",
+        remediation: "Correlate the PID with recent package upgrades; restart legitimately upgraded services and capture /proc/<pid>/ for anything unexplained.",
+        script: r#"for exe in /proc/[0-9]*/exe; do
+  target=$(readlink "$exe" 2>/dev/null) || continue
+  case "$target" in
+  *' (deleted)')
+    pid=${exe#/proc/}
+    printf '%s %s\n' "${pid%/exe}" "$target"
+    ;;
+  esac
+done
+:"#,
         evaluate: has_output,
     },
     Probe {
@@ -94,8 +161,8 @@ pub static BUILTINS: &[Probe] = &[
         category: "kernel",
         description: "Kernel pointer restrictions are disabled, weakening exploit mitigations.",
         remediation: "Set kernel.kptr_restrict=2 unless a documented workload requires otherwise.",
-        script: "cat /proc/sys/kernel/kptr_restrict 2>/dev/null || true",
-        evaluate: |output| output.trim() == "0",
+        script: "cat /proc/sys/kernel/kptr_restrict 2>/dev/null || :",
+        evaluate: is_zero,
     },
     Probe {
         id: "SHUV-KERN-002",
@@ -104,17 +171,20 @@ pub static BUILTINS: &[Probe] = &[
         category: "kernel",
         description: "Unprivileged users can load BPF programs, expanding kernel attack surface.",
         remediation: "Set kernel.unprivileged_bpf_disabled=1 or 2 and document exceptions.",
-        script: "if [ -r /proc/sys/kernel/unprivileged_bpf_disabled ]; then awk '{print ($1 == 0 ? 1 : 0)}' /proc/sys/kernel/unprivileged_bpf_disabled; else echo 0; fi",
-        evaluate: nonzero,
+        script: "cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || :",
+        evaluate: is_zero,
     },
     Probe {
         id: "SHUV-EXEC-001",
-        title: "World-writable directory in system PATH",
+        title: "World-writable system executable directory",
         severity: Severity::High,
         category: "execution",
-        description: "A command search path directory is writable by any local user.",
-        remediation: "Remove the directory from PATH or restore trusted ownership and permissions.",
-        script: "oldifs=$IFS; IFS=:; for d in $PATH; do [ -n \"$d\" ] || d=.; [ -d \"$d\" ] && [ -w \"$d\" ] && find \"$d\" -maxdepth 0 -perm -0002 -print 2>/dev/null; done; IFS=$oldifs",
+        description: "A standard executable directory is writable by any local user, enabling trivial binary planting.",
+        remediation: "Restore root ownership and 0755 permissions, then audit the directory for planted binaries.",
+        script: r#"for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+  [ -d "$d" ] && ! [ -L "$d" ] && find "$d" -maxdepth 0 -perm -0002 -print 2>/dev/null
+done
+:"#,
         evaluate: has_output,
     },
 ];
@@ -132,12 +202,24 @@ mod tests {
     }
 
     #[test]
-    fn unprivileged_bpf_evaluator_only_flags_one() {
-        let probe = BUILTINS
-            .iter()
-            .find(|probe| probe.id == "SHUV-KERN-002")
-            .unwrap();
-        assert!((probe.evaluate)("1"));
-        assert!(!(probe.evaluate)("0"));
+    fn kernel_probes_flag_only_the_permissive_value() {
+        for id in ["SHUV-KERN-001", "SHUV-KERN-002"] {
+            let probe = BUILTINS.iter().find(|probe| probe.id == id).unwrap();
+            assert!((probe.evaluate)("0"));
+            assert!(!(probe.evaluate)("1"));
+            assert!(!(probe.evaluate)("2"));
+            assert!(!(probe.evaluate)(""), "missing sysctl must not flag");
+        }
+    }
+
+    #[test]
+    fn silence_is_a_pass_only_for_output_probes() {
+        for probe in BUILTINS {
+            assert!(
+                !(probe.evaluate)(""),
+                "{} must not fire on empty output",
+                probe.id
+            );
+        }
     }
 }

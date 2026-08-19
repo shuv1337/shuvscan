@@ -9,6 +9,13 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
             "\nshuvscan {}  target={}  probes={}  {}ms",
             report.scanner_version, report.target, report.probes_run, report.duration_ms
         )?;
+        if let Some(host) = &report.host {
+            writeln!(
+                writer,
+                "host {}  kernel {}  {}",
+                host.hostname, host.kernel, host.os
+            )?;
+        }
         writeln!(writer, "{}", "-".repeat(72))?;
         if report.findings.is_empty() {
             writeln!(
@@ -44,15 +51,15 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
     Ok(())
 }
 
-pub fn json(reports: &[ScanReport], mut writer: impl Write) -> Result<(), serde_json::Error> {
-    serde_json::to_writer_pretty(&mut writer, reports)?;
-    writeln!(writer).map_err(serde_json::Error::io)
+pub fn json(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
+    serde_json::to_writer_pretty(&mut writer, reports).map_err(io::Error::from)?;
+    writeln!(writer)
 }
 
-pub fn jsonl(reports: &[ScanReport], mut writer: impl Write) -> Result<(), serde_json::Error> {
+pub fn jsonl(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
     for report in reports {
-        serde_json::to_writer(&mut writer, report)?;
-        writeln!(writer).map_err(serde_json::Error::io)?;
+        serde_json::to_writer(&mut writer, report).map_err(io::Error::from)?;
+        writeln!(writer)?;
     }
     Ok(())
 }

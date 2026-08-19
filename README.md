@@ -51,9 +51,23 @@ Shuvscan never accepts passwords on the command line. Configure keys, host alias
 hardware-backed identities in `~/.ssh/config`; Shuvscan invokes `ssh` with batch mode and strict
 host-key checking enabled.
 
+## Collection model
+
+All probes for a host run inside **one `sh` session over one SSH connection**
+(or one local `sh` for `--target local`). Each probe executes in its own
+subshell, delimited by sentinel lines carrying a per-scan random nonce, so
+attacker-controlled evidence (for example crafted file names) cannot forge or
+terminate a probe section. Each section carries its own exit status; a probe
+that fails to collect — including one that needs privileges the session lacks —
+is reported as a collection error, never as a pass.
+
+Exit codes: `0` clean, `1` findings at or above `--fail-on`,
+`2` usage error, unwritable output, or (with `--strict-collection`) incomplete
+collection.
+
 ## Current probe pack
 
-The initial pack is intentionally small and inspectable:
+The pack is intentionally small and inspectable (`shuvscan --list-probes`):
 
 | Rule | Severity | Signal |
 | --- | --- | --- |
@@ -61,10 +75,22 @@ The initial pack is intentionally small and inspectable:
 | `SHUV-AUTH-002` | high | effective SSH configuration permits root login |
 | `SHUV-AUTH-003` | medium | effective SSH configuration permits passwords |
 | `SHUV-PERSIST-001` | critical | system-wide dynamic linker preload |
+| `SHUV-PERSIST-002` | high | world-writable cron entry |
 | `SHUV-FS-001` | critical | world-writable systemd unit |
+| `SHUV-FS-002` | critical | SUID/SGID binary in /tmp, /var/tmp, or /dev/shm |
+| `SHUV-PROC-001` | medium | process running a deleted executable |
 | `SHUV-KERN-001` | medium | exposed kernel pointers |
 | `SHUV-KERN-002` | high | unprivileged BPF enabled |
-| `SHUV-EXEC-001` | high | world-writable system command path |
+| `SHUV-EXEC-001` | high | world-writable system executable directory |
+
+### Known limitations
+
+- `sshd -T` (effective SSH config) needs root; unprivileged scans report those
+  two probes as *evidence unavailable* rather than silently passing.
+- `/proc/<pid>/exe` links of other users' processes are only readable by root,
+  so `SHUV-PROC-001` sees a partial process list when scanning unprivileged.
+- One thread per `--target`; a bounded scheduler is on the roadmap before
+  large-fleet use.
 
 ## Architecture
 

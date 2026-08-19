@@ -2,11 +2,14 @@
 
 ## Phase 1: Trustworthy collector
 
-- Capability inventory and distro/kernel detection
-- One SSH session per host with multiplexed probe execution
-- Probe timeouts, output budgets, and cancellation
-- Fixture-backed evaluators across major distributions
-- SARIF and OCSF exports
+- [x] One `sh` session per host with nonce-delimited probe multiplexing
+- [x] Per-target timeout, output budgets, and per-probe exit status
+- [x] Basic host metadata (hostname, kernel, distro)
+- [x] Explicit "evidence unavailable" signal instead of silent passes
+- [ ] Capability inventory (root, available tools) driving probe selection
+- [ ] Bounded fleet scheduler with concurrency limits
+- [ ] Fixture-backed evaluators across major distributions
+- [ ] SARIF and OCSF exports
 
 ## Phase 2: Detection engine
 
