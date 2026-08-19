@@ -13,7 +13,7 @@
 
 ## Phase 2: Detection engine
 
-- Signed declarative probe packs with schema validation
+- [x] Signed declarative probe packs with schema validation
 - Package ownership, process ancestry, sockets, namespaces, and container evidence
 - Baselines, suppressions with expiry, and drift-aware scoring
 - Cross-probe correlation with explainable confidence

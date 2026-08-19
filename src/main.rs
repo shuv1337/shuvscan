@@ -1,10 +1,17 @@
-use std::{io, num::NonZeroUsize, process::ExitCode, time::Duration};
+use std::{
+    ffi::OsString,
+    io,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
 
 use clap::{Parser, ValueEnum};
 use shuvscan::{
     engine,
     model::{Severity, Target},
-    output,
+    output, packs,
     probes::BUILTINS,
 };
 
@@ -50,15 +57,47 @@ struct Cli {
     #[arg(long)]
     sudo: bool,
 
-    /// List the built-in probes and exit.
+    /// List probes in the active built-in or signed pack and exit.
     #[arg(long)]
     list_probes: bool,
+
+    /// Signed JSON probe pack manifest to activate instead of the built-in pack.
+    #[arg(long, value_name = "PATH", requires = "probe_pack_key")]
+    probe_pack: Option<PathBuf>,
+
+    /// Trusted Ed25519 public key as 64 hexadecimal characters.
+    #[arg(long, value_name = "PATH", requires = "probe_pack")]
+    probe_pack_key: Option<PathBuf>,
+
+    /// Detached Ed25519 signature; defaults to <probe-pack>.sig.
+    #[arg(long, value_name = "PATH", requires = "probe_pack")]
+    probe_pack_signature: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let verified_pack = match (&cli.probe_pack, &cli.probe_pack_key) {
+        (Some(manifest), Some(key)) => {
+            let signature = cli
+                .probe_pack_signature
+                .clone()
+                .unwrap_or_else(|| signature_path(manifest));
+            match packs::load(manifest, &signature, key) {
+                Ok(pack) => Some(pack),
+                Err(error) => {
+                    eprintln!("shuvscan: invalid probe pack: {error}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+        _ => None,
+    };
+    let probes = verified_pack
+        .as_ref()
+        .map_or(BUILTINS, |pack| pack.probes.as_slice());
+    let probe_pack = verified_pack.as_ref().map(|pack| &pack.info);
     if cli.list_probes {
-        for probe in BUILTINS {
+        for probe in probes {
             println!(
                 "{:<18} {:<9} {:<12} {}",
                 probe.id,
@@ -70,18 +109,20 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let reports = engine::scan_all(
+    let reports = engine::scan_all_with_probes(
         cli.target,
         Duration::from_secs(cli.timeout),
         cli.sudo,
         cli.concurrency,
+        probes,
+        probe_pack,
     );
     let stdout = io::stdout();
     let result = match cli.format {
         Format::Human => output::human(&reports, stdout.lock()),
         Format::Json => output::json(&reports, stdout.lock()),
         Format::Jsonl => output::jsonl(&reports, stdout.lock()),
-        Format::Sarif => output::sarif(&reports, stdout.lock()),
+        Format::Sarif => output::sarif_with_probes(&reports, probes, stdout.lock()),
         Format::Ocsf => output::ocsf(&reports, stdout.lock()),
     };
     if let Err(error) = result {
@@ -103,4 +144,10 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+fn signature_path(manifest: &Path) -> PathBuf {
+    let mut path: OsString = manifest.as_os_str().to_owned();
+    path.push(".sig");
+    path.into()
 }

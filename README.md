@@ -70,6 +70,42 @@ and one Detection Finding per finding. OCSF requires an event timestamp, so
 time. Use the native `json` or `jsonl` formats when the complete Shuvscan report
 schema is required.
 
+### Signed probe packs
+
+A probe pack is a signed, versioned JSON manifest that selects and orders
+reviewed probe assets compiled into Shuvscan. Packs cannot provide shell,
+commands, or evaluator code. This preserves the static-script trust boundary
+while allowing an organization to publish a reproducible policy selection.
+
+```json
+{
+  "schema_version": 1,
+  "id": "org.example.linux-baseline",
+  "version": "1.0.0",
+  "signer": "example-security",
+  "probes": ["SHUV-AUTH-001", "SHUV-KERN-002"]
+}
+```
+
+Activate a pack with its detached Ed25519 signature and an explicitly trusted
+public key:
+
+```bash
+shuvscan \
+  --probe-pack baseline.json \
+  --probe-pack-key example-security.pub \
+  --format json
+```
+
+The public-key file is the 32-byte Ed25519 public key encoded as exactly 64
+hexadecimal characters. The detached signature defaults to
+`baseline.json.sig` and contains the 64-byte signature as exactly 128
+hexadecimal characters; override it with `--probe-pack-signature`. The signature
+covers the exact manifest bytes. Shuvscan verifies it before parsing, then
+rejects unknown fields, unsupported schema versions, malformed metadata,
+duplicate IDs, and IDs that do not resolve to compiled probe assets. The schema
+is published at `docs/probe-pack.schema.json`.
+
 ## Collection model
 
 All probes for a host run inside **one `sh` session over one SSH connection**
@@ -113,6 +149,11 @@ The pack is intentionally small and inspectable (`shuvscan --list-probes`):
   policy permits the reviewed collector.
 - `/proc/<pid>/exe` links of other users' processes are only readable by root,
   so unprivileged `SHUV-PROC-001` results are explicitly marked partial.
+- Pack signatures authenticate exact manifest bytes but do not provide
+  revocation or rollback protection. Pin the expected pack version in deployment
+  configuration and rotate trusted key files when a signer is revoked. Reports
+  record both pack and scanner versions because compiled probe implementations
+  belong to the scanner release.
 - Scheduling is in-memory and non-resumable; resumable fleet scans are planned.
 
 ## Architecture
@@ -161,7 +202,7 @@ cargo test
 
 Design constraints:
 
-- Probe scripts are static scanner assets. Never interpolate target data into shell.
+- Probe scripts are static scanner assets. Never interpolate target or probe-pack data into shell.
 - A failed probe is not a passing probe. Collection errors remain visible in the report.
 - Keep stdout machine-clean for `json` and `jsonl`; diagnostics belong on stderr.
 - Bound evidence before retaining or transmitting it.

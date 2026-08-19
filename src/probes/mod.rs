@@ -18,6 +18,7 @@ pub enum Privilege {
 /// `required_tools` and `privilege` are enforced by the protocol wrapper before
 /// the fragment runs. Root-recommended probes still run unprivileged but report
 /// partial collection.
+#[derive(Clone, Copy, Debug)]
 pub struct Probe {
     pub id: &'static str,
     pub title: &'static str,

@@ -106,12 +106,22 @@ pub struct ScanError {
 pub struct ScanReport {
     pub schema_version: u8,
     pub scanner_version: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe_pack: Option<ProbePackInfo>,
     pub target: String,
     pub host: Option<HostInfo>,
     pub duration_ms: u128,
     pub probes_run: usize,
     pub findings: Vec<Finding>,
     pub errors: Vec<ScanError>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProbePackInfo {
+    pub schema_version: u8,
+    pub id: String,
+    pub version: String,
+    pub signer: String,
 }
 
 impl ScanReport {

@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    model::{ScanError, ScanReport, Target, truncate_evidence},
-    probes::BUILTINS,
+    model::{ProbePackInfo, ScanError, ScanReport, Target, truncate_evidence},
+    probes::{BUILTINS, Probe},
     protocol, transport,
 };
 
@@ -20,9 +20,19 @@ pub const DEFAULT_CONCURRENCY: usize = 16;
 /// non-zero status, or an unavailability sentinel becomes a collection error —
 /// never a silent pass.
 pub fn scan(target: Target, timeout: Duration, sudo: bool) -> ScanReport {
+    scan_with_probes(target, timeout, sudo, BUILTINS, None)
+}
+
+pub fn scan_with_probes(
+    target: Target,
+    timeout: Duration,
+    sudo: bool,
+    probes: &[Probe],
+    probe_pack: Option<&ProbePackInfo>,
+) -> ScanReport {
     let started = Instant::now();
     let nonce = protocol::nonce();
-    let script = protocol::build_script(BUILTINS, &nonce);
+    let script = protocol::build_script(probes, &nonce);
     let mut findings = Vec::new();
     let mut errors = Vec::new();
     let mut host = None;
@@ -42,7 +52,7 @@ pub fn scan(target: Target, timeout: Duration, sudo: bool) -> ScanReport {
                 }),
                 Some(_) => {}
             }
-            for probe in BUILTINS {
+            for probe in probes {
                 let Some(section) = transcript.sections.get(probe.id) else {
                     errors.push(ScanError {
                         probe: probe.id,
@@ -94,10 +104,11 @@ pub fn scan(target: Target, timeout: Duration, sudo: bool) -> ScanReport {
     ScanReport {
         schema_version: 1,
         scanner_version: env!("CARGO_PKG_VERSION"),
+        probe_pack: probe_pack.cloned(),
         target: target.label().to_owned(),
         host,
         duration_ms: started.elapsed().as_millis(),
-        probes_run: BUILTINS.len(),
+        probes_run: probes.len(),
         findings,
         errors,
     }
@@ -109,12 +120,27 @@ pub fn scan_all(
     sudo: bool,
     concurrency: NonZeroUsize,
 ) -> Vec<ScanReport> {
-    scan_all_with(targets, concurrency, |target| scan(target, timeout, sudo))
+    scan_all_with_probes(targets, timeout, sudo, concurrency, BUILTINS, None)
+}
+
+pub fn scan_all_with_probes(
+    targets: Vec<Target>,
+    timeout: Duration,
+    sudo: bool,
+    concurrency: NonZeroUsize,
+    probes: &[Probe],
+    probe_pack: Option<&ProbePackInfo>,
+) -> Vec<ScanReport> {
+    scan_all_with(targets, concurrency, probes.len(), probe_pack, |target| {
+        scan_with_probes(target, timeout, sudo, probes, probe_pack)
+    })
 }
 
 fn scan_all_with<F>(
     targets: Vec<Target>,
     concurrency: NonZeroUsize,
+    probes_run: usize,
+    probe_pack: Option<&ProbePackInfo>,
     scan_target: F,
 ) -> Vec<ScanReport>
 where
@@ -137,7 +163,14 @@ where
                         reports.push((
                             index,
                             panic::catch_unwind(AssertUnwindSafe(|| scan_target(target)))
-                                .unwrap_or_else(|_| panicked_report(label, started.elapsed())),
+                                .unwrap_or_else(|_| {
+                                    panicked_report(
+                                        label,
+                                        started.elapsed(),
+                                        probes_run,
+                                        probe_pack.cloned(),
+                                    )
+                                }),
                         ));
                     }
                     reports
@@ -158,14 +191,20 @@ where
     reports.into_iter().map(|(_, report)| report).collect()
 }
 
-fn panicked_report(target: String, duration: Duration) -> ScanReport {
+fn panicked_report(
+    target: String,
+    duration: Duration,
+    probes_run: usize,
+    probe_pack: Option<ProbePackInfo>,
+) -> ScanReport {
     ScanReport {
         schema_version: 1,
         scanner_version: env!("CARGO_PKG_VERSION"),
+        probe_pack,
         target,
         host: None,
         duration_ms: duration.as_millis(),
-        probes_run: BUILTINS.len(),
+        probes_run,
         findings: Vec::new(),
         errors: vec![ScanError {
             probe: "collector",
@@ -186,6 +225,7 @@ mod tests {
         ScanReport {
             schema_version: 1,
             scanner_version: env!("CARGO_PKG_VERSION"),
+            probe_pack: None,
             target,
             host: None,
             duration_ms: 0,
@@ -224,24 +264,30 @@ mod tests {
             .map(|index| Target::Ssh(format!("host-{index:02}")))
             .collect();
 
-        let reports = scan_all_with(targets, NonZeroUsize::new(3).unwrap(), {
-            let active = Arc::clone(&active);
-            let maximum = Arc::clone(&maximum);
-            move |target| {
-                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                maximum.fetch_max(now, Ordering::SeqCst);
-                let delay = target
-                    .label()
-                    .rsplit_once('-')
-                    .unwrap()
-                    .1
-                    .parse::<u64>()
-                    .unwrap();
-                thread::sleep(Duration::from_millis(delay));
-                active.fetch_sub(1, Ordering::SeqCst);
-                report(target.label().to_owned())
-            }
-        });
+        let reports = scan_all_with(
+            targets,
+            NonZeroUsize::new(3).unwrap(),
+            BUILTINS.len(),
+            None,
+            {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                move |target| {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(now, Ordering::SeqCst);
+                    let delay = target
+                        .label()
+                        .rsplit_once('-')
+                        .unwrap()
+                        .1
+                        .parse::<u64>()
+                        .unwrap();
+                    thread::sleep(Duration::from_millis(delay));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    report(target.label().to_owned())
+                }
+            },
+        );
 
         assert_eq!(reports.len(), 12);
         assert_eq!(maximum.load(Ordering::SeqCst), 3);
@@ -259,17 +305,23 @@ mod tests {
             .map(|target| Target::Ssh(target.into()))
             .collect();
 
-        let reports = scan_all_with(targets, NonZeroUsize::new(1).unwrap(), |target| {
-            assert_ne!(target.label(), "panic", "simulated scan panic");
-            let mut report = report(target.label().to_owned());
-            if target.label() == "failure" {
-                report.errors.push(ScanError {
-                    probe: "collector",
-                    message: "simulated transport failure".into(),
-                });
-            }
-            report
-        });
+        let reports = scan_all_with(
+            targets,
+            NonZeroUsize::new(1).unwrap(),
+            BUILTINS.len(),
+            None,
+            |target| {
+                assert_ne!(target.label(), "panic", "simulated scan panic");
+                let mut report = report(target.label().to_owned());
+                if target.label() == "failure" {
+                    report.errors.push(ScanError {
+                        probe: "collector",
+                        message: "simulated transport failure".into(),
+                    });
+                }
+                report
+            },
+        );
 
         assert_eq!(reports.len(), 4);
         assert_eq!(reports[0].target, "failure");
@@ -283,11 +335,24 @@ mod tests {
     #[test]
     fn fleet_scheduler_handles_empty_and_single_target_inputs() {
         let concurrency = NonZeroUsize::new(4).unwrap();
-        assert!(scan_all_with(Vec::new(), concurrency, |_| unreachable!()).is_empty());
+        assert!(
+            scan_all_with(
+                Vec::new(),
+                concurrency,
+                BUILTINS.len(),
+                None,
+                |_| unreachable!()
+            )
+            .is_empty()
+        );
 
-        let reports = scan_all_with(vec![Target::Local], concurrency, |target| {
-            report(target.label().to_owned())
-        });
+        let reports = scan_all_with(
+            vec![Target::Local],
+            concurrency,
+            BUILTINS.len(),
+            None,
+            |target| report(target.label().to_owned()),
+        );
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].target, "local");
     }

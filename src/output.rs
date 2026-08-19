@@ -19,6 +19,13 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
             "\nshuvscan {}  target={}  probes={}  {}ms",
             report.scanner_version, report.target, report.probes_run, report.duration_ms
         )?;
+        if let Some(pack) = &report.probe_pack {
+            writeln!(
+                writer,
+                "pack {}@{}  signer={}  schema={}",
+                pack.id, pack.version, pack.signer, pack.schema_version
+            )?;
+        }
         if let Some(host) = &report.host {
             writeln!(
                 writer,
@@ -85,7 +92,15 @@ pub fn jsonl(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
 }
 
 pub fn sarif(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
-    let rules = BUILTINS
+    sarif_with_probes(reports, BUILTINS, &mut writer)
+}
+
+pub fn sarif_with_probes(
+    reports: &[ScanReport],
+    probes: &[crate::probes::Probe],
+    mut writer: impl Write,
+) -> io::Result<()> {
+    let rules = probes
         .iter()
         .map(|probe| {
             json!({
@@ -121,7 +136,7 @@ pub fn sarif(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
                         "remediation": finding.remediation
                     }
                 });
-                if let Some(index) = BUILTINS.iter().position(|probe| probe.id == finding.id) {
+                if let Some(index) = probes.iter().position(|probe| probe.id == finding.id) {
                     result["ruleIndex"] = json!(index);
                 }
                 result
@@ -145,23 +160,30 @@ pub fn sarif(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
             })
         })
         .collect::<Vec<_>>();
+    let mut run = json!({
+        "tool": {
+            "driver": {
+                "name": "shuvscan",
+                "version": env!("CARGO_PKG_VERSION"),
+                "rules": rules
+            }
+        },
+        "results": results,
+        "invocations": [{
+            "executionSuccessful": notifications.is_empty(),
+            "toolExecutionNotifications": notifications
+        }]
+    });
+    if let Some(pack) = reports
+        .first()
+        .and_then(|report| report.probe_pack.as_ref())
+    {
+        run["properties"] = json!({ "probePack": pack });
+    }
     let log = json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "shuvscan",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "rules": rules
-                }
-            },
-            "results": results,
-            "invocations": [{
-                "executionSuccessful": notifications.is_empty(),
-                "toolExecutionNotifications": notifications
-            }]
-        }]
+        "runs": [run]
     });
 
     serde_json::to_writer_pretty(&mut writer, &log).map_err(io::Error::from)?;
@@ -193,7 +215,7 @@ fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Res
             .iter()
             .map(|error| json!({ "probe": error.probe, "message": error.message }))
             .collect::<Vec<_>>();
-        events.push(json!({
+        let mut scan_event = json!({
             "activity_id": activity_id,
             "activity_name": activity_name,
             "category_uid": 6,
@@ -219,7 +241,11 @@ fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Res
                     "collection_errors": errors
                 }
             }
-        }));
+        });
+        if let Some(pack) = &report.probe_pack {
+            scan_event["unmapped"]["shuvscan"]["probe_pack"] = json!(pack);
+        }
+        events.push(scan_event);
 
         for finding in &report.findings {
             let mut event = json!({
@@ -265,6 +291,9 @@ fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Res
                     "hostname": host.hostname,
                     "type_id": 0
                 });
+            }
+            if let Some(pack) = &report.probe_pack {
+                event["unmapped"]["shuvscan"]["probe_pack"] = json!(pack);
             }
             events.push(event);
         }
@@ -315,12 +344,13 @@ fn ocsf_severity(severity: Severity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Evidence, Finding, HostCapabilities, HostInfo, ScanError};
+    use crate::model::{Evidence, Finding, HostCapabilities, HostInfo, ProbePackInfo, ScanError};
 
     fn report() -> ScanReport {
         ScanReport {
             schema_version: 1,
             scanner_version: "0.1.0-test",
+            probe_pack: None,
             target: "host.example".into(),
             host: Some(HostInfo {
                 hostname: "fixture-host".into(),
@@ -379,6 +409,28 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+        assert!(run.get("properties").is_none());
+    }
+
+    #[test]
+    fn sarif_records_pack_provenance_for_a_clean_run() {
+        let mut report = report();
+        report.findings.clear();
+        report.probe_pack = Some(ProbePackInfo {
+            schema_version: 1,
+            id: "org.example.baseline".into(),
+            version: "1.2.0".into(),
+            signer: "example-security".into(),
+        });
+        let mut output = Vec::new();
+        sarif_with_probes(&[report], &BUILTINS[..1], &mut output).unwrap();
+        let log: Value = serde_json::from_slice(&output).unwrap();
+
+        assert!(log["runs"][0]["results"].as_array().unwrap().is_empty());
+        assert_eq!(
+            log["runs"][0]["properties"]["probePack"]["id"],
+            "org.example.baseline"
         );
     }
 
