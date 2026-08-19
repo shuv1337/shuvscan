@@ -15,23 +15,26 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{model::HostInfo, probes::Probe};
-
-/// A probe prints this sentinel (optionally followed by a reason) when it can
-/// determine that the evidence it needs cannot be collected in this context,
-/// so silence is never mistaken for a pass.
-pub const UNAVAILABLE: &str = "__SHUVSCAN_UNAVAILABLE__";
+use crate::{
+    model::{HostCapabilities, HostInfo},
+    probes::{Privilege, Probe},
+};
 
 const META_ID: &str = "meta";
+pub(crate) const CAPABILITIES_ID: &str = "capabilities";
 
 const META_BODY: &str = r#"printf 'hostname=%s\n' "$(uname -n 2>/dev/null)"
 printf 'kernel=%s\n' "$(uname -r 2>/dev/null)"
-printf 'os=%s\n' "$( ( . /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-}" ) )""#;
+printf 'os=%s\n' "$( ( . /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-}" ) )"
+printf 'root=%s\n' "$SHUVSCAN_IS_ROOT"
+if command -v sudo >/dev/null 2>&1; then printf 'sudo_present=1\n'; else printf 'sudo_present=0\n'; fi"#;
 
 #[derive(Debug)]
 pub struct Section {
     pub status: i32,
     pub output: String,
+    pub unavailable: Option<String>,
+    pub partial: Option<String>,
 }
 
 #[derive(Debug)]
@@ -64,12 +67,54 @@ pub fn nonce() -> String {
 }
 
 pub fn build_script(probes: &[Probe], nonce: &str) -> String {
-    let mut script = String::from("LC_ALL=C\nexport LC_ALL\n");
+    let mut script = String::from(
+        "LC_ALL=C\nexport LC_ALL\nSHUVSCAN_IS_ROOT=unknown\nif shuvscan_euid=$(id -u 2>/dev/null); then\n  if [ \"$shuvscan_euid\" = 0 ]; then SHUVSCAN_IS_ROOT=1; else SHUVSCAN_IS_ROOT=0; fi\nfi\nexport SHUVSCAN_IS_ROOT\n",
+    );
+    let _ = writeln!(
+        script,
+        "SHUVSCAN_UNAVAILABLE='__SHUVSCAN__{nonce}__UNAVAILABLE__'\nSHUVSCAN_PARTIAL='__SHUVSCAN__{nonce}__PARTIAL__'"
+    );
     push_section(&mut script, nonce, META_ID, META_BODY);
+    let mut tools = probes
+        .iter()
+        .flat_map(|probe| probe.required_tools.iter().copied())
+        .collect::<Vec<_>>();
+    tools.sort_unstable();
+    tools.dedup();
+    let mut capability_body = String::new();
+    for tool in tools {
+        let _ = writeln!(
+            capability_body,
+            "if command -v {tool} >/dev/null 2>&1; then printf 'tool=%s\\n' '{tool}'; fi"
+        );
+    }
+    push_section(&mut script, nonce, CAPABILITIES_ID, &capability_body);
     for probe in probes {
-        push_section(&mut script, nonce, probe.id, probe.script);
+        let body = probe_body(probe);
+        push_section(&mut script, nonce, probe.id, &body);
     }
     script
+}
+
+fn probe_body(probe: &Probe) -> String {
+    let mut body = String::from("shuvscan_missing=\n");
+    for tool in probe.required_tools {
+        let _ = writeln!(
+            body,
+            "command -v {tool} >/dev/null 2>&1 || shuvscan_missing=\"${{shuvscan_missing}} {tool}\""
+        );
+    }
+    body.push_str("if [ -n \"$shuvscan_missing\" ]; then\n  printf '%s missing required tool(s):%s\\n' \"$SHUVSCAN_UNAVAILABLE\" \"$shuvscan_missing\"\n");
+    if probe.privilege == Privilege::RootRequired {
+        body.push_str("elif [ \"$SHUVSCAN_IS_ROOT\" != 1 ]; then\n  printf '%s root access required; rerun with --sudo\\n' \"$SHUVSCAN_UNAVAILABLE\"\n");
+    }
+    body.push_str("else\n");
+    if probe.privilege == Privilege::RootRecommended {
+        body.push_str("  [ \"$SHUVSCAN_IS_ROOT\" = 1 ] || printf '%s root access unavailable; evidence may omit other users\\n' \"$SHUVSCAN_PARTIAL\"\n");
+    }
+    body.push_str(probe.script);
+    body.push_str("\nfi");
+    body
 }
 
 fn push_section(script: &mut String, nonce: &str, id: &str, body: &str) {
@@ -84,6 +129,8 @@ fn push_section(script: &mut String, nonce: &str, id: &str, body: &str) {
 pub fn parse(raw: &str, nonce: &str) -> Transcript {
     let begin_prefix = format!("__SHUVSCAN__{nonce}__BEGIN__");
     let end_prefix = format!("__SHUVSCAN__{nonce}__END__");
+    let unavailable_prefix = format!("__SHUVSCAN__{nonce}__UNAVAILABLE__");
+    let partial_prefix = format!("__SHUVSCAN__{nonce}__PARTIAL__");
     let mut sections: HashMap<String, Section> = HashMap::new();
     let mut current: Option<(String, Vec<&str>)> = None;
 
@@ -104,8 +151,17 @@ pub fn parse(raw: &str, nonce: &str) -> Transcript {
                     .and_then(|tail| tail.strip_suffix("__"))
                 {
                     let status = status_text.parse().unwrap_or(-1);
-                    let output = lines.join("\n").trim().to_owned();
-                    sections.insert(id, Section { status, output });
+                    let (output, unavailable, partial) =
+                        parse_section_output(lines, &unavailable_prefix, &partial_prefix);
+                    sections.insert(
+                        id,
+                        Section {
+                            status,
+                            output,
+                            unavailable,
+                            partial,
+                        },
+                    );
                     continue;
                 }
                 // Structurally impossible without the nonce leaking; fail closed.
@@ -117,17 +173,29 @@ pub fn parse(raw: &str, nonce: &str) -> Transcript {
         }
     }
 
-    let host = sections
-        .get(META_ID)
-        .map(|section| parse_meta(&section.output));
+    let host = sections.get(META_ID).map(|section| {
+        let tools = sections
+            .get(CAPABILITIES_ID)
+            .filter(|section| section.status == 0)
+            .into_iter()
+            .flat_map(|section| section.output.lines())
+            .filter_map(|line| line.strip_prefix("tool=").map(str::to_owned))
+            .collect();
+        parse_meta(&section.output, tools)
+    });
     Transcript { host, sections }
 }
 
-fn parse_meta(output: &str) -> HostInfo {
+fn parse_meta(output: &str, tools: Vec<String>) -> HostInfo {
     let mut host = HostInfo {
         hostname: "unknown".into(),
         kernel: "unknown".into(),
         os: "unknown".into(),
+        capabilities: HostCapabilities {
+            root: None,
+            sudo_present: false,
+            tools,
+        },
     };
     for line in output.lines() {
         if let Some((key, value)) = line.split_once('=') {
@@ -139,11 +207,48 @@ fn parse_meta(output: &str) -> HostInfo {
                 "hostname" => host.hostname = value.to_owned(),
                 "kernel" => host.kernel = value.to_owned(),
                 "os" => host.os = value.to_owned(),
+                "root" => {
+                    host.capabilities.root = match value {
+                        "1" => Some(true),
+                        "0" => Some(false),
+                        _ => None,
+                    }
+                }
+                "sudo_present" => host.capabilities.sudo_present = value == "1",
                 _ => {}
             }
         }
     }
     host
+}
+
+fn parse_section_output(
+    lines: Vec<&str>,
+    unavailable_prefix: &str,
+    partial_prefix: &str,
+) -> (String, Option<String>, Option<String>) {
+    let mut evidence = Vec::new();
+    let mut unavailable = None;
+    let mut partial = None;
+    for line in lines {
+        if let Some(reason) = line.trim().strip_prefix(unavailable_prefix) {
+            unavailable.get_or_insert_with(|| marker_reason(reason));
+        } else if let Some(reason) = line.trim().strip_prefix(partial_prefix) {
+            partial.get_or_insert_with(|| marker_reason(reason));
+        } else {
+            evidence.push(line);
+        }
+    }
+    (evidence.join("\n").trim().to_owned(), unavailable, partial)
+}
+
+fn marker_reason(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        "no reason reported by target".to_owned()
+    } else {
+        reason.to_owned()
+    }
 }
 
 #[cfg(test)]
@@ -162,18 +267,22 @@ mod tests {
     #[test]
     fn parses_sections_and_host_metadata() {
         let raw = format!(
-            "{}{}",
+            "{}{}{}",
             wrap(
                 "meta",
                 0,
-                "hostname=web-01\nkernel=6.8.0\nos=Ubuntu 24.04 LTS"
+                "hostname=web-01\nkernel=6.8.0\nos=Ubuntu 24.04 LTS\nroot=1\nsudo_present=1"
             ),
+            wrap("capabilities", 0, "tool=awk\ntool=find"),
             wrap("SHUV-X", 0, "evidence line")
         );
         let transcript = parse(&raw, NONCE);
         let host = transcript.host.expect("meta parsed");
         assert_eq!(host.hostname, "web-01");
         assert_eq!(host.os, "Ubuntu 24.04 LTS");
+        assert_eq!(host.capabilities.root, Some(true));
+        assert!(host.capabilities.sudo_present);
+        assert_eq!(host.capabilities.tools, ["awk", "find"]);
         assert_eq!(transcript.sections["SHUV-X"].output, "evidence line");
     }
 
@@ -202,6 +311,7 @@ mod tests {
     fn script_wraps_every_probe_and_meta() {
         let script = build_script(BUILTINS, NONCE);
         assert!(script.contains("__BEGIN__meta__"));
+        assert!(script.contains("__BEGIN__capabilities__"));
         for probe in BUILTINS {
             assert!(script.contains(&format!("__BEGIN__{}__", probe.id)));
             assert!(script.contains(&format!("__END__{}__", probe.id)));
@@ -209,7 +319,28 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_sentinel_matches_probe_scripts() {
+    fn script_guards_tools_and_privilege_before_probe_bodies() {
+        let script = build_script(BUILTINS, NONCE);
+        assert!(script.contains("missing required tool(s)"));
+        assert!(script.contains("root access required; rerun with --sudo"));
+        assert!(script.contains("$SHUVSCAN_PARTIAL"));
+        assert!(!script.contains("export SHUVSCAN_UNAVAILABLE"));
+    }
+
+    #[test]
+    fn probe_evidence_cannot_add_reported_capabilities() {
+        let raw = format!(
+            "{}{}{}",
+            wrap("meta", 0, "hostname=host"),
+            wrap("capabilities", 0, "tool=awk"),
+            wrap("SHUV-X", 0, "tool=attacker-controlled")
+        );
+        let transcript = parse(&raw, NONCE);
+        assert_eq!(transcript.host.unwrap().capabilities.tools, ["awk"],);
+    }
+
+    #[test]
+    fn probe_scripts_use_nonce_scoped_unavailability_variable() {
         let users = BUILTINS
             .iter()
             .filter(|probe| probe.script.contains("UNAVAILABLE"))
@@ -217,8 +348,27 @@ mod tests {
         assert!(users >= 2, "sshd probes should use the sentinel");
         for probe in BUILTINS {
             if probe.script.contains("UNAVAILABLE") {
-                assert!(probe.script.contains(UNAVAILABLE));
+                assert!(probe.script.contains("$SHUVSCAN_UNAVAILABLE"));
+                assert!(!probe.script.contains("__SHUVSCAN_UNAVAILABLE__"));
             }
         }
+    }
+
+    #[test]
+    fn fixed_status_marker_in_attacker_evidence_cannot_suppress_finding() {
+        let forged = "__SHUVSCAN_UNAVAILABLE__ forged\nreal threat evidence";
+        let transcript = parse(&wrap("SHUV-X", 0, forged), NONCE);
+        let section = &transcript.sections["SHUV-X"];
+        assert!(section.unavailable.is_none());
+        assert_eq!(section.output, forged);
+    }
+
+    #[test]
+    fn authentic_status_markers_are_parsed_and_removed_from_evidence() {
+        let marker = format!("__SHUVSCAN__{NONCE}__UNAVAILABLE__ missing tool");
+        let transcript = parse(&wrap("SHUV-X", 0, &marker), NONCE);
+        let section = &transcript.sections["SHUV-X"];
+        assert_eq!(section.unavailable.as_deref(), Some("missing tool"));
+        assert!(section.output.is_empty());
     }
 }

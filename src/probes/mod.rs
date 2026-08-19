@@ -1,12 +1,23 @@
 use crate::model::{Evidence, Finding, Severity};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Privilege {
+    Unprivileged,
+    RootRecommended,
+    RootRequired,
+}
+
 /// One read-only check. `script` is a static POSIX `sh` fragment executed in a
 /// subshell on the target; it must exit 0 whenever collection itself succeeded
 /// (a non-zero status is reported as a collection error, never as a pass), and
-/// it prints the `__SHUVSCAN_UNAVAILABLE__` sentinel when it can tell that the
-/// evidence cannot be gathered in the current context (for example without
-/// root). `evaluate` inspects stdout only and decides whether to raise a
-/// finding.
+/// it prints `$SHUVSCAN_UNAVAILABLE` when it can tell that evidence cannot be
+/// gathered in the current context. That variable contains a per-scan nonce;
+/// never print a fixed protocol marker. `evaluate` inspects stdout only and
+/// decides whether to raise a finding.
+///
+/// `required_tools` and `privilege` are enforced by the protocol wrapper before
+/// the fragment runs. Root-recommended probes still run unprivileged but report
+/// partial collection.
 pub struct Probe {
     pub id: &'static str,
     pub title: &'static str,
@@ -14,6 +25,8 @@ pub struct Probe {
     pub category: &'static str,
     pub description: &'static str,
     pub remediation: &'static str,
+    pub required_tools: &'static [&'static str],
+    pub privilege: Privilege,
     pub script: &'static str,
     pub evaluate: fn(&str) -> bool,
 }
@@ -51,6 +64,8 @@ pub static BUILTINS: &[Probe] = &[
         category: "identity",
         description: "An account other than root has superuser privileges.",
         remediation: "Disable the account and investigate its creation, keys, and recent activity.",
+        required_tools: &["awk"],
+        privilege: Privilege::Unprivileged,
         script: "awk -F: '$3 == 0 && $1 != \"root\" {print $1 \":\" $6 \":\" $7}' /etc/passwd 2>/dev/null",
         evaluate: has_output,
     },
@@ -61,12 +76,12 @@ pub static BUILTINS: &[Probe] = &[
         category: "ssh",
         description: "The effective SSH daemon configuration permits direct root authentication.",
         remediation: "Set PermitRootLogin no, validate with sshd -T, and reload sshd.",
-        script: r#"if command -v sshd >/dev/null 2>&1; then
-  if cfg=$(sshd -T 2>/dev/null); then
-    printf '%s\n' "$cfg" | awk '$1 == "permitrootlogin" && $2 == "yes"'
-  else
-    printf '__SHUVSCAN_UNAVAILABLE__ sshd -T failed (usually requires root)\n'
-  fi
+        required_tools: &["awk", "sshd"],
+        privilege: Privilege::RootRequired,
+        script: r#"if cfg=$(sshd -T 2>/dev/null); then
+  printf '%s\n' "$cfg" | awk '$1 == "permitrootlogin" && $2 == "yes"'
+else
+  printf '%s sshd -T failed\n' "$SHUVSCAN_UNAVAILABLE"
 fi"#,
         evaluate: has_output,
     },
@@ -77,12 +92,12 @@ fi"#,
         category: "ssh",
         description: "The SSH daemon accepts password authentication, increasing credential attack exposure.",
         remediation: "Deploy tested key-based access, then set PasswordAuthentication no.",
-        script: r#"if command -v sshd >/dev/null 2>&1; then
-  if cfg=$(sshd -T 2>/dev/null); then
-    printf '%s\n' "$cfg" | awk '$1 == "passwordauthentication" && $2 == "yes"'
-  else
-    printf '__SHUVSCAN_UNAVAILABLE__ sshd -T failed (usually requires root)\n'
-  fi
+        required_tools: &["awk", "sshd"],
+        privilege: Privilege::RootRequired,
+        script: r#"if cfg=$(sshd -T 2>/dev/null); then
+  printf '%s\n' "$cfg" | awk '$1 == "passwordauthentication" && $2 == "yes"'
+else
+  printf '%s sshd -T failed\n' "$SHUVSCAN_UNAVAILABLE"
 fi"#,
         evaluate: has_output,
     },
@@ -93,6 +108,8 @@ fi"#,
         category: "persistence",
         description: "LD_PRELOAD is configured system-wide, a technique frequently used for userland rootkits.",
         remediation: "Isolate the host and validate every referenced library before removing the entry.",
+        required_tools: &["sed"],
+        privilege: Privilege::Unprivileged,
         script: "if [ -s /etc/ld.so.preload ]; then sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' /etc/ld.so.preload 2>/dev/null; fi",
         evaluate: has_output,
     },
@@ -103,6 +120,8 @@ fi"#,
         category: "persistence",
         description: "A cron file or directory can be modified by any local user, allowing scheduled code execution as root.",
         remediation: "Restore root:root ownership and strict permissions, then audit the entries for planted jobs.",
+        required_tools: &["find"],
+        privilege: Privilege::Unprivileged,
         script: r#"for d in /etc/crontab /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /var/spool/cron; do
   [ -e "$d" ] && find "$d" -xdev -perm -0002 \( -type f -o -type d \) -print 2>/dev/null
 done
@@ -116,6 +135,8 @@ done
         category: "persistence",
         description: "A system service definition can be modified by any local user.",
         remediation: "Restore package-owned permissions and inspect the unit and its recent changes.",
+        required_tools: &["find"],
+        privilege: Privilege::Unprivileged,
         script: r#"for d in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
   [ -d "$d" ] && ! [ -L "$d" ] && find "$d" -xdev -type f -perm -0002 -print 2>/dev/null
 done
@@ -129,6 +150,8 @@ done
         category: "filesystem",
         description: "A set-uid or set-gid executable exists in a world-writable temporary directory; no legitimate software installs there.",
         remediation: "Capture the binary for analysis, remove it, and hunt for the process or account that created it.",
+        required_tools: &["find"],
+        privilege: Privilege::Unprivileged,
         script: r#"for d in /tmp /var/tmp /dev/shm; do
   [ -d "$d" ] && find "$d" -xdev \( -perm -4000 -o -perm -2000 \) -type f -print 2>/dev/null
 done
@@ -142,6 +165,8 @@ done
         category: "process",
         description: "A running process executes a binary that no longer exists on disk. Malware deletes itself to evade file scans; package upgrades that replaced the binary are the common benign cause.",
         remediation: "Correlate the PID with recent package upgrades; restart legitimately upgraded services and capture /proc/<pid>/ for anything unexplained.",
+        required_tools: &["readlink"],
+        privilege: Privilege::RootRecommended,
         script: r#"for exe in /proc/[0-9]*/exe; do
   target=$(readlink "$exe" 2>/dev/null) || continue
   case "$target" in
@@ -161,6 +186,8 @@ done
         category: "kernel",
         description: "Kernel pointer restrictions are disabled, weakening exploit mitigations.",
         remediation: "Set kernel.kptr_restrict=2 unless a documented workload requires otherwise.",
+        required_tools: &["cat"],
+        privilege: Privilege::Unprivileged,
         script: "cat /proc/sys/kernel/kptr_restrict 2>/dev/null || :",
         evaluate: is_zero,
     },
@@ -171,6 +198,8 @@ done
         category: "kernel",
         description: "Unprivileged users can load BPF programs, expanding kernel attack surface.",
         remediation: "Set kernel.unprivileged_bpf_disabled=1 or 2 and document exceptions.",
+        required_tools: &["cat"],
+        privilege: Privilege::Unprivileged,
         script: "cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || :",
         evaluate: is_zero,
     },
@@ -181,6 +210,8 @@ done
         category: "execution",
         description: "A standard executable directory is writable by any local user, enabling trivial binary planting.",
         remediation: "Restore root ownership and 0755 permissions, then audit the directory for planted binaries.",
+        required_tools: &["find"],
+        privilege: Privilege::Unprivileged,
         script: r#"for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
   [ -d "$d" ] && ! [ -L "$d" ] && find "$d" -maxdepth 0 -perm -0002 -print 2>/dev/null
 done
@@ -218,6 +249,17 @@ mod tests {
             assert!(
                 !(probe.evaluate)(""),
                 "{} must not fire on empty output",
+                probe.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_builtin_declares_its_runtime_requirements() {
+        for probe in BUILTINS {
+            assert!(
+                !probe.required_tools.is_empty(),
+                "{} must declare required tools",
                 probe.id
             );
         }

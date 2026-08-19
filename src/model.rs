@@ -65,10 +65,18 @@ impl FromStr for Target {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct HostCapabilities {
+    pub root: Option<bool>,
+    pub sudo_present: bool,
+    pub tools: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct HostInfo {
     pub hostname: String,
     pub kernel: String,
     pub os: String,
+    pub capabilities: HostCapabilities,
 }
 
 #[derive(Clone, Debug, Serialize)]

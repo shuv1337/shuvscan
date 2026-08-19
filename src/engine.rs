@@ -15,7 +15,7 @@ const EVIDENCE_LIMIT: usize = 8 * 1024;
 /// section is evaluated independently. A probe with no parseable section, a
 /// non-zero status, or an unavailability sentinel becomes a collection error —
 /// never a silent pass.
-pub fn scan(target: Target, timeout: Duration) -> ScanReport {
+pub fn scan(target: Target, timeout: Duration, sudo: bool) -> ScanReport {
     let started = Instant::now();
     let nonce = protocol::nonce();
     let script = protocol::build_script(BUILTINS, &nonce);
@@ -23,10 +23,21 @@ pub fn scan(target: Target, timeout: Duration) -> ScanReport {
     let mut errors = Vec::new();
     let mut host = None;
 
-    match transport::execute(&target, &script, timeout) {
+    match transport::execute(&target, &script, timeout, sudo) {
         Ok(raw) => {
             let transcript = protocol::parse(&raw, &nonce);
             host = transcript.host;
+            match transcript.sections.get(protocol::CAPABILITIES_ID) {
+                None => errors.push(ScanError {
+                    probe: "capabilities",
+                    message: "collector returned no capability inventory".into(),
+                }),
+                Some(section) if section.status != 0 => errors.push(ScanError {
+                    probe: "capabilities",
+                    message: format!("capability inventory exited with status {}", section.status),
+                }),
+                Some(_) => {}
+            }
             for probe in BUILTINS {
                 let Some(section) = transcript.sections.get(probe.id) else {
                     errors.push(ScanError {
@@ -35,17 +46,28 @@ pub fn scan(target: Target, timeout: Duration) -> ScanReport {
                     });
                     continue;
                 };
-                if let Some(message) = unavailable_reason(&section.output) {
+                if let Some(message) = &section.unavailable {
                     errors.push(ScanError {
                         probe: probe.id,
-                        message,
+                        message: format!("evidence unavailable: {message}"),
                     });
-                } else if section.status != 0 {
+                    continue;
+                }
+                if let Some(message) = &section.partial {
+                    errors.push(ScanError {
+                        probe: probe.id,
+                        message: format!("partial evidence: {message}"),
+                    });
+                }
+                if section.status != 0 {
                     errors.push(ScanError {
                         probe: probe.id,
                         message: format!("probe exited with status {}", section.status),
                     });
-                } else if (probe.evaluate)(&section.output) {
+                } else {
+                    if !(probe.evaluate)(&section.output) {
+                        continue;
+                    }
                     findings.push(
                         probe.finding(truncate_evidence(section.output.clone(), EVIDENCE_LIMIT)),
                     );
@@ -77,24 +99,11 @@ pub fn scan(target: Target, timeout: Duration) -> ScanReport {
     }
 }
 
-fn unavailable_reason(output: &str) -> Option<String> {
-    output.lines().find_map(|line| {
-        line.trim().strip_prefix(protocol::UNAVAILABLE).map(|rest| {
-            let reason = rest.trim();
-            if reason.is_empty() {
-                "evidence unavailable on this target".to_owned()
-            } else {
-                format!("evidence unavailable: {reason}")
-            }
-        })
-    })
-}
-
-pub fn scan_all(targets: Vec<Target>, timeout: Duration) -> Vec<ScanReport> {
+pub fn scan_all(targets: Vec<Target>, timeout: Duration, sudo: bool) -> Vec<ScanReport> {
     let mut reports = thread::scope(|scope| {
         targets
             .into_iter()
-            .map(|target| scope.spawn(move || scan(target, timeout)))
+            .map(|target| scope.spawn(move || scan(target, timeout, sudo)))
             .collect::<Vec<_>>()
             .into_iter()
             .map(|handle| handle.join().expect("scan worker panicked"))
@@ -110,7 +119,7 @@ mod tests {
 
     #[test]
     fn local_scan_collects_every_probe_in_one_session() {
-        let report = scan(Target::Local, Duration::from_secs(60));
+        let report = scan(Target::Local, Duration::from_secs(60), false);
         assert_eq!(report.probes_run, BUILTINS.len());
         assert!(report.host.is_some(), "host metadata should parse locally");
         assert!(

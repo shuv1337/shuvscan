@@ -26,8 +26,13 @@ pub enum TransportError {
 /// Run one collection script on the target through a single `sh -s` session
 /// (local, or remote over one OpenSSH connection). Read-only by contract: the
 /// script is a static scanner asset and target data is never interpolated.
-pub fn execute(target: &Target, script: &str, timeout: Duration) -> Result<String, TransportError> {
-    let mut child = build_command(target)
+pub fn execute(
+    target: &Target,
+    script: &str,
+    timeout: Duration,
+    sudo: bool,
+) -> Result<String, TransportError> {
+    let mut child = build_command(target, sudo)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -74,11 +79,15 @@ pub fn execute(target: &Target, script: &str, timeout: Duration) -> Result<Strin
     ))
 }
 
-fn build_command(target: &Target) -> Command {
+fn build_command(target: &Target, sudo: bool) -> Command {
     match target {
         Target::Local => {
-            let mut command = Command::new("sh");
-            command.arg("-s");
+            let mut command = Command::new(if sudo { "sudo" } else { "sh" });
+            if sudo {
+                command.args(["-n", "--", "sh", "-s"]);
+            } else {
+                command.arg("-s");
+            }
             command
         }
         Target::Ssh(destination) => {
@@ -92,9 +101,12 @@ fn build_command(target: &Target) -> Command {
                 "-oStrictHostKeyChecking=yes",
                 "--",
                 destination,
-                "sh",
-                "-s",
             ]);
+            if sudo {
+                command.args(["sudo", "-n", "--", "sh", "-s"]);
+            } else {
+                command.args(["sh", "-s"]);
+            }
             command
         }
     }
@@ -114,10 +126,17 @@ fn reap(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn local_execution_captures_stdout() {
-        let output = execute(&Target::Local, "printf 'hello'", Duration::from_secs(10)).unwrap();
+        let output = execute(
+            &Target::Local,
+            "printf 'hello'",
+            Duration::from_secs(10),
+            false,
+        )
+        .unwrap();
         assert_eq!(output, "hello");
     }
 
@@ -127,6 +146,7 @@ mod tests {
             &Target::Local,
             "echo boom >&2; exit 7",
             Duration::from_secs(10),
+            false,
         )
         .unwrap_err();
         match error {
@@ -140,7 +160,33 @@ mod tests {
 
     #[test]
     fn hung_collector_times_out() {
-        let error = execute(&Target::Local, "sleep 5", Duration::from_millis(200)).unwrap_err();
+        let error =
+            execute(&Target::Local, "sleep 5", Duration::from_millis(200), false).unwrap_err();
         assert!(matches!(error, TransportError::Timeout(_)));
+    }
+
+    #[test]
+    fn sudo_is_non_interactive_and_executes_only_sh_stdin() {
+        let local = build_command(&Target::Local, true);
+        assert_eq!(local.get_program(), OsStr::new("sudo"));
+        assert_eq!(
+            local.get_args().collect::<Vec<_>>(),
+            ["-n", "--", "sh", "-s"]
+                .iter()
+                .map(OsStr::new)
+                .collect::<Vec<_>>()
+        );
+
+        let remote = build_command(&Target::Ssh("host".into()), true);
+        let args = remote.get_args().collect::<Vec<_>>();
+        assert!(
+            args.ends_with(
+                ["host", "sudo", "-n", "--", "sh", "-s"]
+                    .iter()
+                    .map(OsStr::new)
+                    .collect::<Vec<_>>()
+                    .as_slice()
+            )
+        );
     }
 }

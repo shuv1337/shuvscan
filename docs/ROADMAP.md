@@ -6,7 +6,7 @@
 - [x] Per-target timeout, output budgets, and per-probe exit status
 - [x] Basic host metadata (hostname, kernel, distro)
 - [x] Explicit "evidence unavailable" signal instead of silent passes
-- [ ] Capability inventory (root, available tools) driving probe selection
+- [x] Capability inventory (root, available tools) driving probe selection
 - [ ] Bounded fleet scheduler with concurrency limits
 - [ ] Fixture-backed evaluators across major distributions
 - [ ] SARIF and OCSF exports

@@ -15,6 +15,16 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
                 "host {}  kernel {}  {}",
                 host.hostname, host.kernel, host.os
             )?;
+            writeln!(
+                writer,
+                "capabilities root={}  sudo_present={}  tools={}",
+                host.capabilities
+                    .root
+                    .map(|root| root.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                host.capabilities.sudo_present,
+                host.capabilities.tools.join(",")
+            )?;
         }
         writeln!(writer, "{}", "-".repeat(72))?;
         if report.findings.is_empty() {

@@ -45,11 +45,18 @@ cargo build --release
 
 # Treat incomplete collection as an operational failure.
 ./target/release/shuvscan --target ops@host --strict-collection
+
+# Opt in to bounded, non-interactive privilege escalation of the collector.
+./target/release/shuvscan --target ops@host --sudo
 ```
 
 Shuvscan never accepts passwords on the command line. Configure keys, host aliases, bastions, and
 hardware-backed identities in `~/.ssh/config`; Shuvscan invokes `ssh` with batch mode and strict
 host-key checking enabled.
+
+`--sudo` runs only the built-in, read-only collector through `sudo -n -- sh -s`.
+It never prompts, accepts a password, or falls back silently; sudo policy or authentication
+failures are reported as collection errors.
 
 ## Collection model
 
@@ -60,6 +67,10 @@ attacker-controlled evidence (for example crafted file names) cannot forge or
 terminate a probe section. Each section carries its own exit status; a probe
 that fails to collect — including one that needs privileges the session lacks —
 is reported as a collection error, never as a pass.
+The metadata section inventories root access, sudo presence, and tools required
+by the active probe pack. Missing capabilities skip affected probe bodies with
+an explicit error; probes with a useful but incomplete unprivileged view still
+run and annotate that partial evidence.
 
 Exit codes: `0` clean, `1` findings at or above `--fail-on`,
 `2` usage error, unwritable output, or (with `--strict-collection`) incomplete
@@ -86,9 +97,10 @@ The pack is intentionally small and inspectable (`shuvscan --list-probes`):
 ### Known limitations
 
 - `sshd -T` (effective SSH config) needs root; unprivileged scans report those
-  two probes as *evidence unavailable* rather than silently passing.
+  two probes as *evidence unavailable*. Use `--sudo` when non-interactive sudo
+  policy permits the reviewed collector.
 - `/proc/<pid>/exe` links of other users' processes are only readable by root,
-  so `SHUV-PROC-001` sees a partial process list when scanning unprivileged.
+  so unprivileged `SHUV-PROC-001` results are explicitly marked partial.
 - One thread per `--target`; a bounded scheduler is on the roadmap before
   large-fleet use.
 

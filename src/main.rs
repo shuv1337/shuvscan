@@ -40,6 +40,10 @@ struct Cli {
     #[arg(long)]
     strict_collection: bool,
 
+    /// Run the reviewed collector through non-interactive sudo (`sudo -n`).
+    #[arg(long)]
+    sudo: bool,
+
     /// List the built-in probes and exit.
     #[arg(long)]
     list_probes: bool,
@@ -60,7 +64,7 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let reports = engine::scan_all(cli.target, Duration::from_secs(cli.timeout));
+    let reports = engine::scan_all(cli.target, Duration::from_secs(cli.timeout), cli.sudo);
     let stdout = io::stdout();
     let result = match cli.format {
         Format::Human => output::human(&reports, stdout.lock()),
