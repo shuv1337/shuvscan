@@ -232,6 +232,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 ```
 
+JJ does not provide a `diff --check` flag. For a read-only whitespace check of the current
+working-copy patch, use `jj diff --git | git apply --check --whitespace=error --allow-empty --cached -`;
+use `cargo fmt --check` for Rust formatting and a targeted `rg` check when reviewing a specific
+changed file.
+
 Design constraints:
 
 - Probe scripts are static scanner assets. Never interpolate target or probe-pack data into shell.
