@@ -101,7 +101,9 @@ fn main() -> ExitCode {
             println!(
                 "{:<18} {:<9} {:<12} {}",
                 probe.id,
-                probe.severity.to_string(),
+                probe
+                    .severity()
+                    .map_or_else(|| "evidence".to_owned(), |severity| severity.to_string()),
                 probe.category,
                 probe.title
             );

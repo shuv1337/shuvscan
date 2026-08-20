@@ -34,6 +34,7 @@ pub fn scan_with_probes(
     let nonce = protocol::nonce();
     let script = protocol::build_script(probes, &nonce);
     let mut findings = Vec::new();
+    let mut observations = Vec::new();
     let mut errors = Vec::new();
     let mut host = None;
 
@@ -79,12 +80,19 @@ pub fn scan_with_probes(
                         message: format!("probe exited with status {}", section.status),
                     });
                 } else {
-                    if !(probe.evaluate)(&section.output) {
-                        continue;
+                    let output = truncate_evidence(section.output.clone(), EVIDENCE_LIMIT);
+                    if let Some(finding) = probe.finding(&section.output, output.clone()) {
+                        findings.push(finding);
                     }
-                    findings.push(
-                        probe.finding(truncate_evidence(section.output.clone(), EVIDENCE_LIMIT)),
-                    );
+                    let evidence_budget_exceeded = section.output.len() > EVIDENCE_LIMIT;
+                    if let Some(observation) = probe.observation(
+                        output,
+                        section.partial.clone(),
+                        section.collection_limits.clone(),
+                        evidence_budget_exceeded,
+                    ) {
+                        observations.push(observation);
+                    }
                 }
             }
         }
@@ -110,6 +118,7 @@ pub fn scan_with_probes(
         duration_ms: started.elapsed().as_millis(),
         probes_run: probes.len(),
         findings,
+        observations,
         errors,
     }
 }
@@ -206,6 +215,7 @@ fn panicked_report(
         duration_ms: duration.as_millis(),
         probes_run,
         findings: Vec::new(),
+        observations: Vec::new(),
         errors: vec![ScanError {
             probe: "collector",
             message: "scan worker panicked".into(),
@@ -216,6 +226,10 @@ fn panicked_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        model::Severity,
+        probes::{Privilege, ProbeKind},
+    };
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -231,6 +245,7 @@ mod tests {
             duration_ms: 0,
             probes_run: BUILTINS.len(),
             findings: Vec::new(),
+            observations: Vec::new(),
             errors: Vec::new(),
         }
     }
@@ -253,6 +268,34 @@ mod tests {
             "every probe should produce a section: {:?}",
             report.errors
         );
+    }
+
+    #[test]
+    fn detections_evaluate_full_output_before_evidence_is_truncated() {
+        fn ends_with_signal(output: &str) -> bool {
+            output.ends_with("signal")
+        }
+
+        let probes = [Probe {
+            id: "SHUV-TEST-001",
+            title: "Large output test",
+            category: "test",
+            description: "Test-only probe.",
+            required_tools: &["awk"],
+            privilege: Privilege::Unprivileged,
+            script: "awk 'BEGIN { for (i = 0; i < 9000; i++) printf \"x\"; print \"\"; print \"signal\" }'",
+            kind: ProbeKind::Detection {
+                severity: Severity::Low,
+                remediation: "None.",
+                evaluate: ends_with_signal,
+            },
+        }];
+
+        let report = scan_with_probes(Target::Local, Duration::from_secs(10), false, &probes, None);
+
+        assert!(report.errors.is_empty());
+        assert_eq!(report.findings.len(), 1);
+        assert!(report.findings[0].evidence.output.ends_with("[truncated]"));
     }
 
     #[test]

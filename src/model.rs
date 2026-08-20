@@ -97,6 +97,19 @@ pub struct Finding {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct Observation {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub category: &'static str,
+    pub partial: Option<String>,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub collection_limits: Vec<String>,
+    pub evidence_budget_exceeded: bool,
+    pub evidence: Evidence,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct ScanError {
     pub probe: &'static str,
     pub message: String,
@@ -113,6 +126,8 @@ pub struct ScanReport {
     pub duration_ms: u128,
     pub probes_run: usize,
     pub findings: Vec<Finding>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub observations: Vec<Observation>,
     pub errors: Vec<ScanError>,
 }
 

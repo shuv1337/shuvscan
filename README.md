@@ -63,12 +63,19 @@ Fleet scans run at most 16 targets concurrently by default. Set
 `--concurrency <COUNT>` to tune that bound; zero is rejected.
 
 `--format sarif` emits one SARIF 2.1.0 run. Findings use host logical
-locations, and collection errors are tool execution notifications. `--format
+locations, evidence-only probes are omitted entirely, and collection errors are
+tool execution notifications. Use native JSON/JSONL or OCSF when observations
+are required. `--format
 ocsf` emits an OCSF 1.8.0 JSON array containing one Scan Activity per target
-and one Detection Finding per finding. OCSF requires an event timestamp, so
+and one Detection Finding per finding; observations are retained as encoded JSON
+in the Scan Activity's `unmapped.shuvscan.observations_json` extension. OCSF
+requires an event timestamp, so
 `time` records export time until the native report schema carries scan wall-clock
 time. Use the native `json` or `jsonl` formats when the complete Shuvscan report
 schema is required.
+
+Native report schema version 1 permits additive optional fields. Consumers must
+ignore fields they do not recognize.
 
 ### Signed probe packs
 
@@ -142,13 +149,37 @@ The pack is intentionally small and inspectable (`shuvscan --list-probes`):
 | `SHUV-KERN-002` | high | unprivileged BPF enabled |
 | `SHUV-EXEC-001` | high | world-writable system executable directory |
 
+Evidence-only probes collect context without producing findings or changing the
+severity-based exit code:
+
+| Probe | Evidence |
+| --- | --- |
+| `SHUV-EVID-PKG-001` | bounded running executable ownership from dpkg, RPM, apk, or pacman |
+| `SHUV-EVID-PROC-001` | bounded PID/PPID pairs with real/effective UIDs, name, and command line |
+| `SHUV-EVID-NET-001` | bounded listening TCP/UDP sockets and visible process owners |
+| `SHUV-EVID-NS-001` | bounded per-process Linux namespace identities |
+| `SHUV-EVID-CONT-001` | container markers, cgroups, and container-related mounts |
+
 ### Known limitations
 
 - `sshd -T` (effective SSH config) needs root; unprivileged scans report those
   two probes as *evidence unavailable*. Use `--sudo` when non-interactive sudo
   policy permits the reviewed collector.
 - `/proc/<pid>/exe` links of other users' processes are only readable by root,
-  so unprivileged `SHUV-PROC-001` results are explicitly marked partial.
+  and process/socket/namespace/cgroup visibility can also be restricted by
+  `hidepid` or kernel policy. Those unprivileged results are explicitly marked
+  partial and remain collection errors for `--strict-collection`.
+- Process-based observations retain a low/high PID sample. Access controls may
+  filter either half after sampling; `partial` reports skipped records. Socket
+  observations bound TCP and UDP independently.
+- Package ownership is retained in each package manager's native text format;
+  use `package_manager` when parsing `owner` values across distributions.
+- Each observation has collector-specific work bounds and an 8 KiB retained
+  evidence budget. `collection_limits` names every collector bound reached;
+  `evidence_budget_exceeded` reports byte truncation; `truncated` is true when
+  either applies. On ordinary multi-process hosts, process sample limits and
+  therefore `truncated: true` are expected. Absence beyond any boundary must not
+  be interpreted as proof.
 - Pack signatures authenticate exact manifest bytes but do not provide
   revocation or rollback protection. Pin the expected pack version in deployment
   configuration and rotate trusted key files when a signer is revoked. Reports
@@ -165,7 +196,8 @@ CLI / future TUI
 scan engine ---- stable report schema ---- human | JSON | NDJSON | SARIF | OCSF
       |
       v
-probe pack ---- evaluator ---- finding + bounded evidence
+probe pack ---- detection evaluator ---- finding
+           `---- evidence collector ---- bounded observation
       |
       v
 transport ---- local sh | OpenSSH ---- unmodified Linux host

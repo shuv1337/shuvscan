@@ -35,6 +35,7 @@ pub struct Section {
     pub output: String,
     pub unavailable: Option<String>,
     pub partial: Option<String>,
+    pub collection_limits: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -72,7 +73,7 @@ pub fn build_script(probes: &[Probe], nonce: &str) -> String {
     );
     let _ = writeln!(
         script,
-        "SHUVSCAN_UNAVAILABLE='__SHUVSCAN__{nonce}__UNAVAILABLE__'\nSHUVSCAN_PARTIAL='__SHUVSCAN__{nonce}__PARTIAL__'"
+        "SHUVSCAN_UNAVAILABLE='__SHUVSCAN__{nonce}__UNAVAILABLE__'\nSHUVSCAN_PARTIAL='__SHUVSCAN__{nonce}__PARTIAL__'\nSHUVSCAN_TRUNCATED='__SHUVSCAN__{nonce}__TRUNCATED__'"
     );
     push_section(&mut script, nonce, META_ID, META_BODY);
     let mut tools = probes
@@ -122,7 +123,7 @@ fn push_section(script: &mut String, nonce: &str, id: &str, body: &str) {
     // fresh line even when a probe's last write omits the trailing newline.
     let _ = write!(
         script,
-        "printf '%s\\n' '__SHUVSCAN__{nonce}__BEGIN__{id}__'\n(\n{body}\n)\nprintf '\\n__SHUVSCAN__{nonce}__END__{id}__%s__\\n' \"$?\"\n"
+        "printf '%s\\n' '__SHUVSCAN__{nonce}__BEGIN__{id}__'\n(\n{body}\n) </dev/null\nprintf '\\n__SHUVSCAN__{nonce}__END__{id}__%s__\\n' \"$?\"\n"
     );
 }
 
@@ -131,6 +132,7 @@ pub fn parse(raw: &str, nonce: &str) -> Transcript {
     let end_prefix = format!("__SHUVSCAN__{nonce}__END__");
     let unavailable_prefix = format!("__SHUVSCAN__{nonce}__UNAVAILABLE__");
     let partial_prefix = format!("__SHUVSCAN__{nonce}__PARTIAL__");
+    let truncated_prefix = format!("__SHUVSCAN__{nonce}__TRUNCATED__");
     let mut sections: HashMap<String, Section> = HashMap::new();
     let mut current: Option<(String, Vec<&str>)> = None;
 
@@ -151,8 +153,12 @@ pub fn parse(raw: &str, nonce: &str) -> Transcript {
                     .and_then(|tail| tail.strip_suffix("__"))
                 {
                     let status = status_text.parse().unwrap_or(-1);
-                    let (output, unavailable, partial) =
-                        parse_section_output(lines, &unavailable_prefix, &partial_prefix);
+                    let (output, unavailable, partial, collection_limits) = parse_section_output(
+                        lines,
+                        &unavailable_prefix,
+                        &partial_prefix,
+                        &truncated_prefix,
+                    );
                     sections.insert(
                         id,
                         Section {
@@ -160,6 +166,7 @@ pub fn parse(raw: &str, nonce: &str) -> Transcript {
                             output,
                             unavailable,
                             partial,
+                            collection_limits,
                         },
                     );
                     continue;
@@ -226,20 +233,29 @@ fn parse_section_output(
     lines: Vec<&str>,
     unavailable_prefix: &str,
     partial_prefix: &str,
-) -> (String, Option<String>, Option<String>) {
+    truncated_prefix: &str,
+) -> (String, Option<String>, Option<String>, Vec<String>) {
     let mut evidence = Vec::new();
     let mut unavailable = None;
-    let mut partial = None;
+    let mut partial = Vec::new();
+    let mut collection_limits = Vec::new();
     for line in lines {
         if let Some(reason) = line.trim().strip_prefix(unavailable_prefix) {
             unavailable.get_or_insert_with(|| marker_reason(reason));
         } else if let Some(reason) = line.trim().strip_prefix(partial_prefix) {
-            partial.get_or_insert_with(|| marker_reason(reason));
+            partial.push(marker_reason(reason));
+        } else if let Some(reason) = line.trim().strip_prefix(truncated_prefix) {
+            collection_limits.push(marker_reason(reason));
         } else {
             evidence.push(line);
         }
     }
-    (evidence.join("\n").trim().to_owned(), unavailable, partial)
+    (
+        evidence.join("\n").trim().to_owned(),
+        unavailable,
+        (!partial.is_empty()).then(|| partial.join("; ")),
+        collection_limits,
+    )
 }
 
 fn marker_reason(reason: &str) -> String {
@@ -340,18 +356,59 @@ mod tests {
     }
 
     #[test]
-    fn probe_scripts_use_nonce_scoped_unavailability_variable() {
-        let users = BUILTINS
-            .iter()
-            .filter(|probe| probe.script.contains("UNAVAILABLE"))
-            .count();
-        assert!(users >= 2, "sshd probes should use the sentinel");
+    fn probe_scripts_use_only_nonce_scoped_status_variables() {
+        let markers = [
+            ("UNAVAILABLE", "$SHUVSCAN_UNAVAILABLE"),
+            ("PARTIAL", "$SHUVSCAN_PARTIAL"),
+            ("TRUNCATED", "$SHUVSCAN_TRUNCATED"),
+        ];
         for probe in BUILTINS {
-            if probe.script.contains("UNAVAILABLE") {
-                assert!(probe.script.contains("$SHUVSCAN_UNAVAILABLE"));
-                assert!(!probe.script.contains("__SHUVSCAN_UNAVAILABLE__"));
+            for (name, variable) in markers {
+                if probe.script.contains(name) {
+                    assert!(probe.script.contains(variable));
+                    assert!(!probe.script.contains(&format!("__SHUVSCAN_{name}__")));
+                }
             }
         }
+    }
+
+    #[test]
+    fn probe_subshells_cannot_consume_the_collector_script() {
+        let probes = [
+            Probe {
+                id: "SHUV-TEST-001",
+                title: "stdin reader",
+                category: "test",
+                description: "test",
+                required_tools: &["cat"],
+                privilege: Privilege::Unprivileged,
+                script: "cat >/dev/null",
+                kind: crate::probes::ProbeKind::Evidence,
+            },
+            Probe {
+                id: "SHUV-TEST-002",
+                title: "following probe",
+                category: "test",
+                description: "test",
+                required_tools: &[],
+                privilege: Privilege::Unprivileged,
+                script: "printf 'still-running\\n'",
+                kind: crate::probes::ProbeKind::Evidence,
+            },
+        ];
+        let script = build_script(&probes, NONCE);
+        let mut child = std::process::Command::new("sh")
+            .arg("-s")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), script.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let transcript = parse(&String::from_utf8(output.stdout).unwrap(), NONCE);
+
+        assert!(output.status.success());
+        assert_eq!(transcript.sections["SHUV-TEST-002"].output, "still-running");
     }
 
     #[test]
@@ -370,5 +427,43 @@ mod tests {
         let section = &transcript.sections["SHUV-X"];
         assert_eq!(section.unavailable.as_deref(), Some("missing tool"));
         assert!(section.output.is_empty());
+    }
+
+    #[test]
+    fn authentic_truncation_marker_is_parsed_and_removed_from_evidence() {
+        let marker = format!("__SHUVSCAN__{NONCE}__TRUNCATED__ low_high_process_sample=24");
+        let transcript = parse(&wrap("SHUV-X", 0, &format!("evidence\n{marker}")), NONCE);
+        let section = &transcript.sections["SHUV-X"];
+
+        assert_eq!(section.collection_limits, ["low_high_process_sample=24"]);
+        assert_eq!(section.output, "evidence");
+    }
+
+    #[test]
+    fn forged_fixed_truncation_marker_stays_evidence() {
+        let forged = "__SHUVSCAN_TRUNCATED__ max_processes=24";
+        let transcript = parse(&wrap("SHUV-X", 0, forged), NONCE);
+        let section = &transcript.sections["SHUV-X"];
+
+        assert!(section.collection_limits.is_empty());
+        assert_eq!(section.output, forged);
+    }
+
+    #[test]
+    fn all_partial_and_collection_limit_reasons_are_preserved() {
+        let partial = format!(
+            "__SHUVSCAN__{NONCE}__PARTIAL__ root unavailable\n__SHUVSCAN__{NONCE}__PARTIAL__ skipped=9\n__SHUVSCAN__{NONCE}__TRUNCATED__ low_high_process_sample=24\n__SHUVSCAN__{NONCE}__TRUNCATED__ max_mounts=32"
+        );
+        let transcript = parse(&wrap("SHUV-X", 0, &partial), NONCE);
+        let section = &transcript.sections["SHUV-X"];
+
+        assert_eq!(
+            section.partial.as_deref(),
+            Some("root unavailable; skipped=9")
+        );
+        assert_eq!(
+            section.collection_limits,
+            ["low_high_process_sample=24", "max_mounts=32"]
+        );
     }
 }

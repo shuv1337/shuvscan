@@ -17,20 +17,28 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
         writeln!(
             writer,
             "\nshuvscan {}  target={}  probes={}  {}ms",
-            report.scanner_version, report.target, report.probes_run, report.duration_ms
+            terminal_safe(report.scanner_version),
+            terminal_safe(&report.target),
+            report.probes_run,
+            report.duration_ms
         )?;
         if let Some(pack) = &report.probe_pack {
             writeln!(
                 writer,
                 "pack {}@{}  signer={}  schema={}",
-                pack.id, pack.version, pack.signer, pack.schema_version
+                terminal_safe(&pack.id),
+                terminal_safe(&pack.version),
+                terminal_safe(&pack.signer),
+                pack.schema_version
             )?;
         }
         if let Some(host) = &report.host {
             writeln!(
                 writer,
                 "host {}  kernel {}  {}",
-                host.hostname, host.kernel, host.os
+                terminal_safe(&host.hostname),
+                terminal_safe(&host.kernel),
+                terminal_safe(&host.os)
             )?;
             writeln!(
                 writer,
@@ -40,7 +48,7 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
                     .map(|root| root.to_string())
                     .unwrap_or_else(|| "unknown".into()),
                 host.capabilities.sudo_present,
-                host.capabilities.tools.join(",")
+                terminal_safe(&host.capabilities.tools.join(","))
             )?;
         }
         writeln!(writer, "{}", "-".repeat(72))?;
@@ -60,22 +68,66 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
             )?;
             if !finding.evidence.output.is_empty() {
                 for line in finding.evidence.output.lines().take(4) {
-                    writeln!(writer, "         evidence: {line}")?;
+                    writeln!(writer, "         evidence: {}", terminal_safe(line))?;
                 }
             }
             writeln!(writer, "         fix: {}", finding.remediation)?;
         }
+        for observation in &report.observations {
+            writeln!(writer, "EVIDENCE {}  {}", observation.id, observation.title)?;
+            if let Some(partial) = &observation.partial {
+                writeln!(writer, "         partial: {}", terminal_safe(partial))?;
+            }
+            if observation.truncated {
+                writeln!(writer, "         truncated: true")?;
+            }
+            for limit in &observation.collection_limits {
+                writeln!(
+                    writer,
+                    "         collection limit: {}",
+                    terminal_safe(limit)
+                )?;
+            }
+            if observation.evidence_budget_exceeded {
+                writeln!(writer, "         evidence budget exceeded: true")?;
+            }
+            let line_count = observation.evidence.output.lines().count();
+            for line in observation.evidence.output.lines().take(2) {
+                writeln!(writer, "         data: {}", terminal_safe(line))?;
+            }
+            if line_count > 2 {
+                writeln!(writer, "         data: ... {} more line(s)", line_count - 2)?;
+            }
+        }
         for error in &report.errors {
-            writeln!(writer, "ERROR    {}  {}", error.probe, error.message)?;
+            writeln!(
+                writer,
+                "ERROR    {}  {}",
+                terminal_safe(error.probe),
+                terminal_safe(&error.message)
+            )?;
         }
         writeln!(
             writer,
-            "\n{} finding(s), {} collection error(s)",
+            "\n{} finding(s), {} observation(s), {} collection error(s)",
             report.findings.len(),
+            report.observations.len(),
             report.errors.len()
         )?;
     }
     Ok(())
+}
+
+fn terminal_safe(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_control() {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
 }
 
 pub fn json(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
@@ -100,15 +152,21 @@ pub fn sarif_with_probes(
     probes: &[crate::probes::Probe],
     mut writer: impl Write,
 ) -> io::Result<()> {
-    let rules = probes
+    let detection_probes = probes
+        .iter()
+        .filter(|probe| probe.evaluator().is_some())
+        .collect::<Vec<_>>();
+    let rules = detection_probes
         .iter()
         .map(|probe| {
+            let severity = probe.severity().expect("filtered detection probe");
+            let remediation = probe.remediation().expect("filtered detection probe");
             json!({
                 "id": probe.id,
                 "shortDescription": { "text": probe.title },
                 "fullDescription": { "text": probe.description },
-                "help": { "text": probe.remediation },
-                "defaultConfiguration": { "level": sarif_level(probe.severity) },
+                "help": { "text": remediation },
+                "defaultConfiguration": { "level": sarif_level(severity) },
                 "properties": { "tags": ["security", probe.category] }
             })
         })
@@ -136,14 +194,18 @@ pub fn sarif_with_probes(
                         "remediation": finding.remediation
                     }
                 });
-                if let Some(index) = probes.iter().position(|probe| probe.id == finding.id) {
+                if let Some(index) = detection_probes
+                    .iter()
+                    .position(|probe| probe.id == finding.id)
+                {
                     result["ruleIndex"] = json!(index);
                 }
                 result
             })
         })
         .collect::<Vec<_>>();
-    let notifications = reports
+    let collection_failed = reports.iter().any(|report| !report.errors.is_empty());
+    let mut notifications = reports
         .iter()
         .flat_map(|report| {
             report.errors.iter().map(|error| {
@@ -160,6 +222,24 @@ pub fn sarif_with_probes(
             })
         })
         .collect::<Vec<_>>();
+    notifications.extend(reports.iter().filter(|report| !report.observations.is_empty()).map(
+        |report| {
+            json!({
+                "level": "note",
+                "message": {
+                    "text": format!(
+                        "{}: {} evidence observation(s) omitted from SARIF; use JSON, JSONL, or OCSF",
+                        report.target,
+                        report.observations.len()
+                    )
+                },
+                "properties": {
+                    "target": report.target,
+                    "observationsOmitted": report.observations.len()
+                }
+            })
+        },
+    ));
     let mut run = json!({
         "tool": {
             "driver": {
@@ -170,7 +250,7 @@ pub fn sarif_with_probes(
         },
         "results": results,
         "invocations": [{
-            "executionSuccessful": notifications.is_empty(),
+            "executionSuccessful": !collection_failed,
             "toolExecutionNotifications": notifications
         }]
     });
@@ -244,6 +324,12 @@ fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Res
         });
         if let Some(pack) = &report.probe_pack {
             scan_event["unmapped"]["shuvscan"]["probe_pack"] = json!(pack);
+        }
+        if !report.observations.is_empty() {
+            let observations = serde_json::to_string(&report.observations).map_err(|error| {
+                io::Error::other(format!("could not encode observations: {error}"))
+            })?;
+            scan_event["unmapped"]["shuvscan"]["observations_json"] = json!(observations);
         }
         events.push(scan_event);
 
@@ -344,7 +430,9 @@ fn ocsf_severity(severity: Severity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Evidence, Finding, HostCapabilities, HostInfo, ProbePackInfo, ScanError};
+    use crate::model::{
+        Evidence, Finding, HostCapabilities, HostInfo, Observation, ProbePackInfo, ScanError,
+    };
 
     fn report() -> ScanReport {
         ScanReport {
@@ -376,6 +464,19 @@ mod tests {
                     output: "maintenance:/root:/bin/sh\n".into(),
                 },
             }],
+            observations: vec![Observation {
+                id: "SHUV-EVID-PROC-001",
+                title: "Sampled PID and parent PID pairs",
+                category: "process",
+                partial: Some("root access unavailable".into()),
+                truncated: false,
+                collection_limits: Vec::new(),
+                evidence_budget_exceeded: false,
+                evidence: Evidence {
+                    command: "proc fixture",
+                    output: "pid=42\tppid=1".into(),
+                },
+            }],
             errors: vec![ScanError {
                 probe: "SHUV-AUTH-002",
                 message: "requires root".into(),
@@ -393,7 +494,10 @@ mod tests {
         assert_eq!(log["version"], "2.1.0");
         assert_eq!(
             run["tool"]["driver"]["rules"].as_array().unwrap().len(),
-            BUILTINS.len()
+            BUILTINS
+                .iter()
+                .filter(|probe| probe.evaluator().is_some())
+                .count()
         );
         assert_eq!(run["results"].as_array().unwrap().len(), 1);
         assert_eq!(run["results"][0]["ruleId"], "SHUV-AUTH-001");
@@ -408,9 +512,56 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            1
+            2
         );
         assert!(run.get("properties").is_none());
+    }
+
+    #[test]
+    fn human_output_discloses_truncated_observations() {
+        let mut report = report();
+        report.observations[0].truncated = true;
+        let mut output = Vec::new();
+
+        human(&[report], &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("truncated: true"));
+    }
+
+    #[test]
+    fn human_output_escapes_terminal_control_characters() {
+        let mut report = report();
+        report.findings[0].evidence.output = "finding=\u{1b}[31mred".into();
+        report.observations[0].evidence.output = "cmd=\u{1b}[2Jclear".into();
+        report.host.as_mut().unwrap().capabilities.tools = vec!["awk\u{1b}[2J".into()];
+        let mut output = Vec::new();
+
+        human(&[report], &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains('\u{1b}'));
+        assert!(output.contains(r"finding=\u{1b}[31mred"));
+        assert!(output.contains(r"cmd=\u{1b}[2Jclear"));
+        assert!(output.contains(r"tools=awk\u{1b}[2J"));
+    }
+
+    #[test]
+    fn sarif_notes_that_observations_are_omitted_without_failing_execution() {
+        let mut report = report();
+        report.errors.clear();
+        let mut output = Vec::new();
+
+        sarif(&[report], &mut output).unwrap();
+
+        let log: Value = serde_json::from_slice(&output).unwrap();
+        let invocation = &log["runs"][0]["invocations"][0];
+        assert_eq!(invocation["executionSuccessful"], true);
+        assert_eq!(invocation["toolExecutionNotifications"][0]["level"], "note");
+        assert_eq!(
+            invocation["toolExecutionNotifications"][0]["properties"]["observationsOmitted"],
+            1
+        );
     }
 
     #[test]
@@ -446,6 +597,13 @@ mod tests {
         assert_eq!(events[0]["type_uid"], 600702);
         assert_eq!(events[0]["num_detections"], 1);
         assert_eq!(events[0]["status"], "Failure");
+        let observations: Value = serde_json::from_str(
+            events[0]["unmapped"]["shuvscan"]["observations_json"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(observations[0]["id"], "SHUV-EVID-PROC-001");
         assert_eq!(
             events[0]["unmapped"]["shuvscan"]["collection_errors"][0]["probe"],
             "SHUV-AUTH-002"

@@ -297,5 +297,25 @@ mod tests {
         assert_eq!(schema["properties"]["signer"]["maxLength"], 128);
         assert_eq!(schema["properties"]["probes"]["minItems"], 1);
         assert_eq!(schema["properties"]["probes"]["uniqueItems"], true);
+        assert_eq!(
+            schema["properties"]["probes"]["items"]["pattern"],
+            "^SHUV-[A-Z0-9]+(?:-[A-Z0-9]+)*-[0-9]{3}$"
+        );
+        for probe in BUILTINS {
+            let parts = probe.id.split('-').collect::<Vec<_>>();
+            assert!(
+                parts.len() >= 3
+                    && parts[0] == "SHUV"
+                    && parts[1..parts.len() - 1].iter().all(|part| !part.is_empty()
+                        && part.chars().all(|character| character.is_ascii_uppercase()
+                            || character.is_ascii_digit()))
+                    && parts.last().is_some_and(|suffix| {
+                        suffix.len() == 3
+                            && suffix.chars().all(|character| character.is_ascii_digit())
+                    }),
+                "built-in id does not match the published schema: {}",
+                probe.id
+            );
+        }
     }
 }

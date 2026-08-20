@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::Deserialize;
-use shuvscan::probes::BUILTINS;
+use shuvscan::probes::{BUILTINS, ProbeKind};
 
 const EXPECTED_DISTROS: &[&str] = &["alpine-3.20", "debian-12", "rhel-9", "ubuntu-24.04"];
 
@@ -37,6 +37,7 @@ struct Omission {
 fn distro_fixtures_match_builtin_evaluators() {
     let probes = BUILTINS
         .iter()
+        .filter(|probe| matches!(probe.kind, ProbeKind::Detection { .. }))
         .map(|probe| (probe.id, probe))
         .collect::<BTreeMap<_, _>>();
     let mut covered = BTreeSet::new();
@@ -71,13 +72,14 @@ fn distro_fixtures_match_builtin_evaluators() {
             let probe = probes
                 .get(case.probe.as_str())
                 .unwrap_or_else(|| panic!("unknown probe {} in {expected_distro}", case.probe));
+            let evaluate = probe.evaluator().expect("fixture probe is a detection");
             assert!(
-                !(probe.evaluate)(&case.non_finding),
+                !evaluate(&case.non_finding),
                 "{} false positive in {expected_distro}",
                 case.probe
             );
             assert!(
-                (probe.evaluate)(&case.finding),
+                evaluate(&case.finding),
                 "{} missed finding in {expected_distro}",
                 case.probe
             );
