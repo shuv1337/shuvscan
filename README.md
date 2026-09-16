@@ -252,11 +252,16 @@ The ambitious version of Shuvscan is a local-first Linux defense workbench:
 
 ## Development
 
+These are the checks CI runs (`.github/workflows/ci.yml`); run them before committing:
+
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo test --locked
+cargo deny check
 ```
+
+CI also verifies the declared Rust 1.85 MSRV with `cargo check --locked --all-targets`.
 
 JJ does not provide a `diff --check` flag. For a read-only whitespace check of the current
 working-copy patch, use `jj diff --git | git apply --check --whitespace=error --allow-empty --cached -`;
@@ -266,10 +271,14 @@ changed file.
 Design constraints:
 
 - Probe scripts are static scanner assets. Never interpolate target or probe-pack data into shell.
-- A failed probe is not a passing probe. Collection errors remain visible in the report.
+- Signed packs may select compiled probes but never supply executable code.
+- Probes are read-only; see `SECURITY.md` for what the built-in pack will not accept.
+- A failed probe is not a passing probe. Collection errors and partial evidence remain visible in
+  the report and are never reported as clean passes.
 - Keep stdout machine-clean for `json` and `jsonl`; diagnostics belong on stderr.
-- Bound evidence before retaining or transmitting it.
-- New findings require a stable ID, remediation, evaluator tests, and safe/unsafe fixtures.
+- Bound work and retained output at collection time, not only during serialization.
+- New findings require a stable ID, remediation, collector behavior tests, evaluator tests, and
+  safe/unsafe fixtures.
 
 ## Status
 
