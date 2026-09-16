@@ -213,13 +213,7 @@ done
         script: r#"for d in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
   if [ -d "$d" ]; then
     if ! find -H "$d" -xdev \( -type f -o -type l \) -exec sh -c '
-      shuvscan_failed=0
-      for shuvscan_unit do
-        if ! find -H "$shuvscan_unit" -xdev \( ! -type f -prune -o -perm -0002 -print \) 2>/dev/null; then
-          shuvscan_failed=1
-        fi
-      done
-      exit "$shuvscan_failed"
+      find -H "$@" -xdev \( ! -type f -prune -o -perm -0002 -print \) 2>/dev/null
     ' sh {} +; then
       printf '%s could not completely inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
     fi
@@ -260,6 +254,7 @@ done
         shuvscan_mount_best=-1
         shuvscan_mount_result=
         while IFS=" " read -r shuvscan_mount_id shuvscan_mount_parent shuvscan_mount_device shuvscan_mount_root shuvscan_mount_point shuvscan_mount_options shuvscan_mount_rest; do
+          shuvscan_mount_point=$(printf "%b" "$shuvscan_mount_point") || continue
           shuvscan_mount_matches=0
           if [ "$shuvscan_mount_point" = / ]; then
             shuvscan_mount_matches=1
@@ -1049,6 +1044,39 @@ mod tests {
     }
 
     #[test]
+    fn temp_setid_probe_decodes_mountinfo_paths() {
+        let directory = stub_dir();
+        let root = directory.join("temporary-root");
+        let nested = root.join("nested bind");
+        fs::create_dir_all(&nested).unwrap();
+        let candidate = nested.join("root-setuid");
+        write_file_with_mode(&candidate, 0o4700);
+        let metadata = fs::metadata(&root).unwrap();
+        let escaped_nested = nested.display().to_string().replace(' ', "\\040");
+        let mountinfo = format!(
+            "1 0 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / {} rw - tmpfs tmpfs rw\n3 2 0:2 / {escaped_nested} rw,nosuid - tmpfs tmpfs rw,nosuid\n",
+            root.display()
+        );
+
+        let output = run_temp_setid_probe_with_mountinfo(
+            &directory,
+            &root,
+            &mountinfo,
+            metadata.uid(),
+            metadata.gid(),
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+
+        assert!(output.status.success());
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line == candidate.to_str().unwrap())
+        );
+    }
+
+    #[test]
     fn temp_setid_probe_follows_a_symlinked_root() {
         use std::os::unix::fs::symlink;
 
@@ -1143,6 +1171,33 @@ mod tests {
         assert!(!stdout.contains("dangling.service"));
         assert!(!stdout.contains("masked.service"));
         assert!(!stdout.contains("PARTIAL:"));
+    }
+
+    #[test]
+    fn systemd_unit_probe_batches_target_checks() {
+        let directory = stub_dir();
+        let root = directory.join("root");
+        fs::create_dir(&root).unwrap();
+        for index in 0..256 {
+            fs::write(root.join(format!("fixture-{index}.service")), "[Service]\n").unwrap();
+        }
+        let count_file = directory.join("find-count");
+        write_stub(
+            &directory,
+            "find",
+            &format!(
+                "count=0; [ ! -f '{0}' ] || count=$(cat '{0}'); count=$((count + 1)); printf '%s' \"$count\" > '{0}'; exec /usr/bin/find \"$@\"",
+                count_file.display()
+            ),
+        );
+
+        let output = run_systemd_unit_probe(&directory, &[&root]);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let calls: usize = fs::read_to_string(&count_file).unwrap().parse().unwrap();
+        fs::remove_dir_all(directory).unwrap();
+
+        assert!(output.status.success(), "{stdout}");
+        assert!(calls <= 3, "expected batched find calls, observed {calls}");
     }
 
     #[test]

@@ -178,6 +178,13 @@ severity-based exit code:
 | `SHUV-EVID-NS-001` | bounded per-process Linux namespace identities |
 | `SHUV-EVID-CONT-001` | container markers, cgroups, and container-related mounts |
 
+`SHUV-AUTH-002` intentionally treats every effective `PermitRootLogin` mode
+except `no` as a high-severity finding. That includes OpenSSH's common
+`prohibit-password` default and `forced-commands-only`: both still permit direct
+root authentication with keys. This is a hardening policy choice, not a claim
+that those modes permit password authentication; `SHUV-AUTH-003` evaluates
+password authentication separately.
+
 ### Known limitations
 
 - `sshd -T` (effective SSH config) needs root; unprivileged scans report those
@@ -209,7 +216,13 @@ severity-based exit code:
 - The transport retains at most 512 KiB of collector stdout and 4 KiB of
   stderr per target while continuing to drain excess bytes. Crossing the stdout
   limit marks the target as a collector failure because the framed transcript
-  may be incomplete.
+  may be incomplete. Large package inventories contribute to this shared bound;
+  increase filtering at the probe level rather than treating a truncated target
+  as clean.
+- Timeout cleanup kills the collector's dedicated process group. A hostile or
+  defective collector descendant can escape that group by starting a new
+  session; it will not be killed by Shuvscan, but pipe completion remains bound
+  by the original timeout so it cannot indefinitely hang the scan.
 - Pack signatures authenticate exact manifest bytes but do not provide
   revocation or rollback protection. Pin the expected pack version in deployment
   configuration and rotate trusted key files when a signer is revoked. Reports

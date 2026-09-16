@@ -41,12 +41,49 @@ pub struct Transcript {
 /// Random marker nonce. Protocol framing is a security boundary, so collection
 /// fails rather than falling back to predictable entropy.
 pub fn nonce() -> io::Result<String> {
-    let mut bytes = [0u8; 8];
-    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    random_hex(8)
+}
+
+pub(crate) fn random_hex(byte_count: usize) -> io::Result<String> {
+    let mut bytes = vec![0u8; byte_count];
+    fill_random(&mut bytes)?;
     Ok(bytes.iter().fold(String::new(), |mut hex, byte| {
         let _ = write!(hex, "{byte:02x}");
         hex
     }))
+}
+
+fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < bytes.len() {
+        // SAFETY: the pointer and length describe the writable remainder of
+        // `bytes`; flags zero requests blocking kernel-provided randomness.
+        let read = unsafe {
+            libc::getrandom(bytes[filled..].as_mut_ptr().cast(), bytes.len() - filled, 0)
+        };
+        if read > 0 {
+            filled += usize::try_from(read)
+                .map_err(|_| io::Error::other("getrandom returned an invalid length"))?;
+            continue;
+        }
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "getrandom returned no bytes",
+            ));
+        }
+
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if matches!(error.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) {
+            fs::File::open("/dev/urandom")?.read_exact(&mut bytes[filled..])?;
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub fn build_script(probes: &[Probe], nonce: &str) -> String {
@@ -59,7 +96,7 @@ pub fn build_script(probes: &[Probe], nonce: &str) -> String {
     );
     push_section(&mut script, nonce, META_ID, META_BODY);
     let os_release_body = format!(
-        "if [ -r /etc/os-release ]; then\n  if command -v od >/dev/null 2>&1; then\n    od -A n -t x1 -v -N {} /etc/os-release 2>/dev/null || printf '%s os-release read failed\\n' \"$SHUVSCAN_UNAVAILABLE\"\n  else\n    printf '%s od is required to read os-release safely\\n' \"$SHUVSCAN_UNAVAILABLE\"\n  fi\nfi",
+        "if [ -e /etc/os-release ] || [ -L /etc/os-release ]; then\n  if [ ! -r /etc/os-release ]; then\n    printf '%s os-release is not readable\\n' \"$SHUVSCAN_UNAVAILABLE\"\n  elif command -v od >/dev/null 2>&1; then\n    od -A n -t x1 -v -N {} /etc/os-release 2>/dev/null || printf '%s os-release read failed\\n' \"$SHUVSCAN_UNAVAILABLE\"\n  else\n    printf '%s od is required to read os-release safely\\n' \"$SHUVSCAN_UNAVAILABLE\"\n  fi\nfi",
         OS_RELEASE_LIMIT + 1
     );
     push_section(&mut script, nonce, OS_RELEASE_ID, &os_release_body);
@@ -174,7 +211,7 @@ pub fn parse(raw: &str, nonce: &str) -> Transcript {
         match parse_os_release_hex(&section.output) {
             Ok(os) => os,
             Err(error) => {
-                section.unavailable = Some(error.to_owned());
+                section.unavailable = Some(error);
                 None
             }
         }
@@ -227,7 +264,7 @@ fn parse_meta(output: &str, tools: Vec<String>, os: Option<String>) -> HostInfo 
     host
 }
 
-fn parse_os_release_hex(encoded: &str) -> Result<Option<String>, &'static str> {
+fn parse_os_release_hex(encoded: &str) -> Result<Option<String>, String> {
     let mut bytes = Vec::new();
     let mut high = None;
     for byte in encoded.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
@@ -235,21 +272,24 @@ fn parse_os_release_hex(encoded: &str) -> Result<Option<String>, &'static str> {
             b'0'..=b'9' => byte - b'0',
             b'a'..=b'f' => byte - b'a' + 10,
             b'A'..=b'F' => byte - b'A' + 10,
-            _ => return Err("os-release collector returned invalid hex"),
+            _ => return Err("os-release collector returned invalid hex".into()),
         };
         if let Some(high) = high.take() {
             bytes.push((high << 4) | nibble);
             if bytes.len() > OS_RELEASE_LIMIT {
-                return Err("os-release exceeded the 16384-byte collection limit");
+                return Err(format!(
+                    "os-release exceeded the {OS_RELEASE_LIMIT}-byte collection limit"
+                ));
             }
         } else {
             high = Some(nibble);
         }
     }
     if high.is_some() {
-        return Err("os-release collector returned incomplete hex");
+        return Err("os-release collector returned incomplete hex".into());
     }
-    let contents = std::str::from_utf8(&bytes).map_err(|_| "os-release is not valid UTF-8")?;
+    let contents =
+        std::str::from_utf8(&bytes).map_err(|_| "os-release is not valid UTF-8".to_owned())?;
     Ok(parse_os_release(contents))
 }
 
@@ -432,12 +472,25 @@ mod tests {
         assert!(script.contains("__BEGIN__os-release__"));
         assert!(script.contains("__BEGIN__capabilities__"));
         assert!(script.contains("od -A n -t x1 -v -N 16385 /etc/os-release"));
+        assert!(script.contains("[ ! -r /etc/os-release ]"));
+        assert!(script.contains("os-release is not readable"));
         assert!(!script.contains(". /etc/os-release"));
         assert!(!script.contains("eval "));
         for probe in BUILTINS {
             assert!(script.contains(&format!("__BEGIN__{}__", probe.id)));
             assert!(script.contains(&format!("__END__{}__", probe.id)));
         }
+    }
+
+    #[test]
+    fn random_values_use_kernel_entropy() {
+        let first = nonce().unwrap();
+        let second = nonce().unwrap();
+
+        assert_eq!(first.len(), 16);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+        assert_eq!(random_hex(16).unwrap().len(), 32);
     }
 
     #[test]

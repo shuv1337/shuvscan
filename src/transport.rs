@@ -1,14 +1,16 @@
 use std::{
     io::{ErrorKind, Read, Write},
     os::unix::process::CommandExt,
-    process::{Child, Command, Stdio},
-    sync::Mutex,
+    process::{Command, Stdio},
+    sync::{
+        Mutex,
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
-use wait_timeout::ChildExt;
 
 use crate::model::Target;
 
@@ -55,47 +57,56 @@ pub fn execute(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let group = ActiveGroup::register(child.id());
+    let mut group = ActiveGroup::register(child.id());
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
 
     // Drain both pipes on threads so a chatty collector can never fill a pipe
     // buffer and deadlock against our stdin write or the timeout wait.
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let stderr_pipe = child.stderr.take().expect("piped stderr");
-    let stdout_reader = thread::spawn(move || drain_capped(stdout_pipe, STDOUT_LIMIT));
-    let stderr_reader = thread::spawn(move || drain_capped(stderr_pipe, STDERR_LIMIT));
+    let (stdout_sender, stdout_reader) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = stdout_sender.send(drain_capped(stdout_pipe, STDOUT_LIMIT));
+    });
+    let (stderr_sender, stderr_reader) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = stderr_sender.send(drain_capped(stderr_pipe, STDERR_LIMIT));
+    });
 
     let mut stdin = child.stdin.take().expect("piped stdin");
     let script = script.as_bytes().to_vec();
-    let stdin_writer = thread::spawn(move || stdin.write_all(&script));
+    let (stdin_sender, stdin_writer) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = stdin_sender.send(stdin.write_all(&script));
+    });
 
-    let status = match child.wait_timeout(timeout) {
-        Ok(Some(status)) => status,
-        Ok(None) => {
-            reap_group(&mut child);
-            let _ = stdin_writer.join();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+    match wait_for_exit_without_reaping(child.id(), deadline) {
+        Ok(true) => {
+            // Kill the group while the exited leader is still a zombie. Its PID
+            // cannot be reused until `wait`, so the group ID still identifies
+            // only this collector and any descendants it left behind.
+            terminate_group(child.id());
+            group.unregister();
+        }
+        Ok(false) => {
+            terminate_group(child.id());
+            group.unregister();
+            let _ = child.wait();
             return Err(TransportError::Timeout(timeout));
         }
         Err(error) => {
-            reap_group(&mut child);
-            let _ = stdin_writer.join();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
+            terminate_group(child.id());
+            group.unregister();
+            let _ = child.wait();
             return Err(error.into());
         }
-    };
-    // A collector must not leave background descendants holding our pipes.
-    drop(group);
-    let write_result = stdin_writer
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("collector stdin writer panicked")));
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| std::io::Error::other("collector stdout reader panicked"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| std::io::Error::other("collector stderr reader panicked"))?;
+    }
+    let status = child.wait()?;
+    let write_result = receive_before(stdin_writer, deadline, timeout, "stdin writer")?;
+    let stdout = receive_before(stdout_reader, deadline, timeout, "stdout reader")?;
+    let stderr = receive_before(stderr_reader, deadline, timeout, "stderr reader")?;
     let stdout = stdout?;
     let stderr = stderr?;
 
@@ -161,9 +172,11 @@ fn drain_capped(mut pipe: impl Read, limit: usize) -> std::io::Result<CappedOutp
     let mut chunk = [0_u8; 8 * 1024];
     let mut truncated = false;
     loop {
-        match pipe.read(&mut chunk)? {
-            0 => break,
-            read => {
+        match pipe.read(&mut chunk) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+            Ok(0) => break,
+            Ok(read) => {
                 let remaining = limit.saturating_sub(bytes.len());
                 let retained = remaining.min(read);
                 bytes.extend_from_slice(&chunk[..retained]);
@@ -172,6 +185,60 @@ fn drain_capped(mut pipe: impl Read, limit: usize) -> std::io::Result<CappedOutp
         }
     }
     Ok(CappedOutput { bytes, truncated })
+}
+
+fn wait_for_exit_without_reaping(pid: u32, deadline: Instant) -> std::io::Result<bool> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| std::io::Error::other("collector PID does not fit pid_t"))?;
+    loop {
+        // `WNOWAIT` leaves the exited leader as a zombie, reserving its PID and
+        // process-group ID until the caller has killed descendants.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` points to valid writable storage and `pid` is the
+        // positive PID returned by `Child::id`.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as _,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: `waitid` initialized `info`; `si_pid` is valid for a
+            // reported child state and zero when no state was available.
+            if unsafe { info.si_pid() } == pid {
+                return Ok(true);
+            }
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(false);
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(10)));
+    }
+}
+
+fn receive_before<T>(
+    receiver: Receiver<T>,
+    deadline: Instant,
+    timeout: Duration,
+    worker: &str,
+) -> Result<T, TransportError> {
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(result) => Ok(result),
+        Err(RecvTimeoutError::Timeout) => Err(TransportError::Timeout(timeout)),
+        Err(RecvTimeoutError::Disconnected) => {
+            Err(std::io::Error::other(format!("collector {worker} stopped unexpectedly")).into())
+        }
+    }
 }
 
 fn terminate_group(pid: u32) {
@@ -184,26 +251,29 @@ fn terminate_group(pid: u32) {
     }
 }
 
-fn reap_group(child: &mut Child) {
-    terminate_group(child.id());
-    let _ = child.wait();
-}
-
 /// Registration of one collector process group for the lifetime of its
 /// session; dropping it kills the group so nothing outlives the transport.
-struct ActiveGroup(u32);
+struct ActiveGroup(Option<u32>);
 
 impl ActiveGroup {
     fn register(pid: u32) -> Self {
         active_groups().push(pid);
-        Self(pid)
+        Self(Some(pid))
+    }
+
+    fn unregister(&mut self) {
+        if let Some(pid) = self.0.take() {
+            active_groups().retain(|active| *active != pid);
+        }
     }
 }
 
 impl Drop for ActiveGroup {
     fn drop(&mut self) {
-        terminate_group(self.0);
-        active_groups().retain(|pid| *pid != self.0);
+        if let Some(pid) = self.0 {
+            terminate_group(pid);
+            active_groups().retain(|active| *active != pid);
+        }
     }
 }
 
@@ -250,7 +320,27 @@ pub fn forward_interrupts_to_collectors() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{ffi::OsStr, fs};
+    use std::{
+        ffi::OsStr,
+        fs,
+        io::{Cursor, Error},
+        time::Instant,
+    };
+
+    struct InterruptedOnce {
+        interrupted: bool,
+        remaining: Cursor<Vec<u8>>,
+    }
+
+    impl Read for InterruptedOnce {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(Error::from(ErrorKind::Interrupted));
+            }
+            self.remaining.read(buffer)
+        }
+    }
 
     #[test]
     fn local_execution_captures_stdout() {
@@ -305,6 +395,21 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_pipe_reads_are_retried() {
+        let output = drain_capped(
+            InterruptedOnce {
+                interrupted: false,
+                remaining: Cursor::new(b"complete".to_vec()),
+            },
+            32,
+        )
+        .unwrap();
+
+        assert_eq!(output.bytes, b"complete");
+        assert!(!output.truncated);
+    }
+
+    #[test]
     fn timeout_includes_a_blocked_script_writer() {
         let mut script = String::from("exec sleep 30\n");
         script.push_str(&"# filler\n".repeat(200_000));
@@ -346,6 +451,40 @@ mod tests {
             state.is_none() || state == Some('Z'),
             "descendant state: {state:?}"
         );
+    }
+
+    #[test]
+    fn escaped_pipe_holder_cannot_extend_the_timeout() {
+        if Command::new("setsid").arg("--help").output().is_err() {
+            return;
+        }
+        let pid_file = std::env::temp_dir().join(format!(
+            "shuvscan-escaped-descendant-{}-{}",
+            std::process::id(),
+            crate::protocol::nonce().unwrap()
+        ));
+        let script = format!(
+            "setsid sh -c 'printf %s \"$$\" > \"{}\"; sleep 30' &",
+            pid_file.display()
+        );
+        let started = Instant::now();
+
+        let error =
+            execute(&Target::Local, &script, Duration::from_millis(300), false).unwrap_err();
+        assert!(matches!(error, TransportError::Timeout(_)));
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        if let Ok(pid) = fs::read_to_string(&pid_file).and_then(|pid| {
+            pid.parse::<i32>()
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        }) {
+            // SAFETY: best-effort cleanup of the fixture's escaped process
+            // group, including the foreground `sleep`.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        let _ = fs::remove_file(pid_file);
     }
 
     #[test]

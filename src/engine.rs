@@ -438,12 +438,14 @@ fn unix_millis() -> u64 {
 
 fn new_scan_id() -> String {
     static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-    format!(
-        "{:013x}-{:x}-{:x}",
-        unix_millis(),
-        std::process::id(),
-        NEXT_ID.fetch_add(1, Ordering::Relaxed)
-    )
+    protocol::random_hex(16).unwrap_or_else(|_| {
+        format!(
+            "{:013x}-{:x}-{:x}",
+            unix_millis(),
+            std::process::id(),
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -474,6 +476,16 @@ mod tests {
             observations: Vec::new(),
             errors: Vec::new(),
         }
+    }
+
+    #[test]
+    fn scan_ids_are_random_128_bit_hex_values() {
+        let first = new_scan_id();
+        let second = new_scan_id();
+
+        assert_eq!(first.len(), 32);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 
     #[test]
