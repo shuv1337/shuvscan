@@ -6,14 +6,7 @@
 //! an attacker on the target (for example a crafted file name printed by
 //! `find`) cannot forge or terminate a section.
 
-use std::{
-    collections::HashMap,
-    fmt::Write as _,
-    fs,
-    hash::{DefaultHasher, Hash, Hasher},
-    io::Read,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, fmt::Write as _, fs, io, io::Read};
 
 use crate::{
     model::{HostCapabilities, HostInfo},
@@ -44,27 +37,15 @@ pub struct Transcript {
     pub sections: HashMap<String, Section>,
 }
 
-/// Random marker nonce. Prefers the kernel CSPRNG; the time/pid fallback only
-/// exists for exotic build targets and still avoids trivially guessable values.
-pub fn nonce() -> String {
+/// Random marker nonce. Protocol framing is a security boundary, so collection
+/// fails rather than falling back to predictable entropy.
+pub fn nonce() -> io::Result<String> {
     let mut bytes = [0u8; 8];
-    if fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .is_ok()
-    {
-        return bytes.iter().fold(String::new(), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        });
-    }
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    }))
 }
 
 pub fn build_script(probes: &[Probe], nonce: &str) -> String {

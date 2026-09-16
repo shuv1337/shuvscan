@@ -2,7 +2,7 @@
   "distro": "alpine-3.20",
   "cases": [
     { "probe": "SHUV-AUTH-001", "non_finding": "", "finding": "rescue:/root:/bin/ash\n" },
-    { "probe": "SHUV-AUTH-002", "non_finding": "", "finding": "permitrootlogin yes\n" },
+    { "probe": "SHUV-AUTH-002", "non_finding": "", "finding": "permitrootlogin prohibit-password\n" },
     { "probe": "SHUV-AUTH-003", "non_finding": "", "finding": "passwordauthentication yes\n" },
     { "probe": "SHUV-PERSIST-002", "non_finding": "", "finding": "/var/spool/cron/crontabs/root\n" },
     { "probe": "SHUV-FS-002", "non_finding": "", "finding": "/dev/shm/trace\n" },

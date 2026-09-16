@@ -1,9 +1,12 @@
 use std::{
     num::NonZeroUsize,
     panic::{self, AssertUnwindSafe},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
@@ -15,12 +18,27 @@ use crate::{
 const EVIDENCE_LIMIT: usize = 8 * 1024;
 pub const DEFAULT_CONCURRENCY: usize = 16;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScanSummary {
+    pub highest_severity: Option<crate::model::Severity>,
+    pub collector_failed: bool,
+    pub collection_incomplete: bool,
+}
+
+impl ScanSummary {
+    pub fn include(&mut self, report: &ScanReport) {
+        self.highest_severity = self.highest_severity.max(report.highest_severity());
+        self.collector_failed |= report.errors.iter().any(|error| error.probe == "collector");
+        self.collection_incomplete |= !report.errors.is_empty();
+    }
+}
+
 /// Scan one target: a single transport session collects every probe, then each
 /// section is evaluated independently. A probe with no parseable section, a
 /// non-zero status, or an unavailability sentinel becomes a collection error —
 /// never a silent pass.
 pub fn scan(target: Target, timeout: Duration, sudo: bool) -> ScanReport {
-    scan_with_probes(target, timeout, sudo, BUILTINS, None)
+    scan_with_context(target, timeout, sudo, BUILTINS, None, &new_scan_id())
 }
 
 pub fn scan_with_probes(
@@ -30,18 +48,40 @@ pub fn scan_with_probes(
     probes: &[Probe],
     probe_pack: Option<&ProbePackInfo>,
 ) -> ScanReport {
+    scan_with_context(target, timeout, sudo, probes, probe_pack, &new_scan_id())
+}
+
+fn scan_with_context(
+    target: Target,
+    timeout: Duration,
+    sudo: bool,
+    probes: &[Probe],
+    probe_pack: Option<&ProbePackInfo>,
+    scan_id: &str,
+) -> ScanReport {
+    let started_at = unix_millis();
     let started = Instant::now();
-    let nonce = protocol::nonce();
-    let script = protocol::build_script(probes, &nonce);
     let mut findings = Vec::new();
     let mut observations = Vec::new();
     let mut errors = Vec::new();
     let mut host = None;
 
-    match transport::execute(&target, &script, timeout, sudo) {
-        Ok(raw) => {
-            let transcript = protocol::parse(&raw, &nonce);
+    let nonce = protocol::nonce();
+    match nonce.and_then(|nonce| {
+        let script = protocol::build_script(probes, &nonce);
+        transport::execute(&target, &script, timeout, sudo)
+            .map(|output| (nonce, output))
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    }) {
+        Ok((nonce, raw)) => {
+            let transcript = protocol::parse(&raw.stdout, &nonce);
             host = transcript.host;
+            if raw.stdout_truncated {
+                errors.push(ScanError {
+                    probe: "collector",
+                    message: "collector stdout exceeded the 524288-byte transport limit; report is incomplete".into(),
+                });
+            }
             match transcript.sections.get(protocol::CAPABILITIES_ID) {
                 None => errors.push(ScanError {
                     probe: "capabilities",
@@ -98,7 +138,7 @@ pub fn scan_with_probes(
         }
         Err(error) => errors.push(ScanError {
             probe: "collector",
-            message: error.to_string(),
+            message: format!("collector setup or execution failed: {error}"),
         }),
     }
 
@@ -112,6 +152,9 @@ pub fn scan_with_probes(
     ScanReport {
         schema_version: 1,
         scanner_version: env!("CARGO_PKG_VERSION"),
+        scan_id: scan_id.to_owned(),
+        started_at,
+        completed_at: unix_millis(),
         probe_pack: probe_pack.cloned(),
         target: target.label().to_owned(),
         host,
@@ -140,9 +183,15 @@ pub fn scan_all_with_probes(
     probes: &[Probe],
     probe_pack: Option<&ProbePackInfo>,
 ) -> Vec<ScanReport> {
-    scan_all_with(targets, concurrency, probes.len(), probe_pack, |target| {
-        scan_with_probes(target, timeout, sudo, probes, probe_pack)
-    })
+    let scan_id = new_scan_id();
+    scan_all_with(
+        targets,
+        concurrency,
+        probes.len(),
+        probe_pack,
+        &scan_id,
+        |target| scan_with_context(target, timeout, sudo, probes, probe_pack, &scan_id),
+    )
 }
 
 fn scan_all_with<F>(
@@ -150,6 +199,7 @@ fn scan_all_with<F>(
     concurrency: NonZeroUsize,
     probes_run: usize,
     probe_pack: Option<&ProbePackInfo>,
+    scan_id: &str,
     scan_target: F,
 ) -> Vec<ScanReport>
 where
@@ -178,6 +228,7 @@ where
                                         started.elapsed(),
                                         probes_run,
                                         probe_pack.cloned(),
+                                        scan_id.to_owned(),
                                     )
                                 }),
                         ));
@@ -205,10 +256,15 @@ fn panicked_report(
     duration: Duration,
     probes_run: usize,
     probe_pack: Option<ProbePackInfo>,
+    scan_id: String,
 ) -> ScanReport {
     ScanReport {
         schema_version: 1,
         scanner_version: env!("CARGO_PKG_VERSION"),
+        scan_id,
+        started_at: unix_millis()
+            .saturating_sub(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
+        completed_at: unix_millis(),
         probe_pack,
         target,
         host: None,
@@ -221,6 +277,89 @@ fn panicked_report(
             message: "scan worker panicked".into(),
         }],
     }
+}
+
+pub fn scan_all_unordered_with_probes<E, F>(
+    targets: Vec<Target>,
+    timeout: Duration,
+    sudo: bool,
+    concurrency: NonZeroUsize,
+    probes: &[Probe],
+    probe_pack: Option<&ProbePackInfo>,
+    mut on_report: F,
+) -> Result<ScanSummary, (E, ScanSummary)>
+where
+    F: FnMut(&ScanReport) -> Result<(), E>,
+{
+    let scan_id = new_scan_id();
+    let next = AtomicUsize::new(0);
+    let worker_count = concurrency.get().min(targets.len());
+    let (sender, receiver) = mpsc::sync_channel(worker_count.max(1));
+    let mut summary = ScanSummary::default();
+    let mut first_error = None;
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            let sender = sender.clone();
+            let scan_id = &scan_id;
+            let next = &next;
+            let targets = &targets;
+            scope.spawn(move || {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(target) = targets.get(index).cloned() else {
+                        break;
+                    };
+                    let label = target.label().to_owned();
+                    let started = Instant::now();
+                    let report = panic::catch_unwind(AssertUnwindSafe(|| {
+                        scan_with_context(target, timeout, sudo, probes, probe_pack, scan_id)
+                    }))
+                    .unwrap_or_else(|_| {
+                        panicked_report(
+                            label,
+                            started.elapsed(),
+                            probes.len(),
+                            probe_pack.cloned(),
+                            scan_id.to_owned(),
+                        )
+                    });
+                    if sender.send(report).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        for report in receiver {
+            summary.include(&report);
+            if first_error.is_none() {
+                if let Err(error) = on_report(&report) {
+                    first_error = Some(error);
+                }
+            }
+        }
+    });
+
+    first_error.map_or(Ok(summary), |error| Err((error, summary)))
+}
+
+fn unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn new_scan_id() -> String {
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+    format!(
+        "{:013x}-{:x}-{:x}",
+        unix_millis(),
+        std::process::id(),
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 #[cfg(test)]
@@ -239,6 +378,9 @@ mod tests {
         ScanReport {
             schema_version: 1,
             scanner_version: env!("CARGO_PKG_VERSION"),
+            scan_id: "test-scan".into(),
+            started_at: 1_723_000_000_000,
+            completed_at: 1_723_000_000_042,
             probe_pack: None,
             target,
             host: None,
@@ -312,6 +454,7 @@ mod tests {
             NonZeroUsize::new(3).unwrap(),
             BUILTINS.len(),
             None,
+            "test-scan",
             {
                 let active = Arc::clone(&active);
                 let maximum = Arc::clone(&maximum);
@@ -353,6 +496,7 @@ mod tests {
             NonZeroUsize::new(1).unwrap(),
             BUILTINS.len(),
             None,
+            "test-scan",
             |target| {
                 assert_ne!(target.label(), "panic", "simulated scan panic");
                 let mut report = report(target.label().to_owned());
@@ -384,6 +528,7 @@ mod tests {
                 concurrency,
                 BUILTINS.len(),
                 None,
+                "test-scan",
                 |_| unreachable!()
             )
             .is_empty()
@@ -394,6 +539,7 @@ mod tests {
             concurrency,
             BUILTINS.len(),
             None,
+            "test-scan",
             |target| report(target.label().to_owned()),
         );
         assert_eq!(reports.len(), 1);

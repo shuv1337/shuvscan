@@ -47,6 +47,10 @@ cargo build --release
 # Treat incomplete collection as an operational failure.
 ./target/release/shuvscan --target ops@host --strict-collection
 
+# Stream a very large fleet as JSONL in completion order with bounded memory.
+./target/release/shuvscan --target host-01 --target host-02 \
+  --format jsonl --unordered
+
 # Opt in to bounded, non-interactive privilege escalation of the collector.
 ./target/release/shuvscan --target ops@host --sudo
 ```
@@ -61,6 +65,13 @@ failures are reported as collection errors.
 
 Fleet scans run at most 16 targets concurrently by default. Set
 `--concurrency <COUNT>` to tune that bound; zero is rejected.
+Timeouts must also be non-zero. A timeout terminates the collector process
+group, including descendants created by a local collector.
+
+By default, reports are sorted by target and buffered until the fleet
+completes. `--format jsonl --unordered` instead writes each target as it
+finishes, avoids retaining the complete fleet, and is the recommended mode for
+very large scans. Repeating a target intentionally scans it repeatedly.
 
 `--format sarif` emits one SARIF 2.1.0 run. Findings use host logical
 locations, evidence-only probes are omitted entirely, and collection errors are
@@ -69,13 +80,17 @@ are required. `--format
 ocsf` emits an OCSF 1.8.0 JSON array containing one Scan Activity per target
 and one Detection Finding per finding; observations are retained as encoded JSON
 in the Scan Activity's `unmapped.shuvscan.observations_json` extension. OCSF
-requires an event timestamp, so
-`time` records export time until the native report schema carries scan wall-clock
-time. Use the native `json` or `jsonl` formats when the complete Shuvscan report
-schema is required.
+`time` records the target's collection completion time, and finding UIDs include
+the invocation's scan ID. SARIF run and result properties carry the same scan
+identity. Use the native `json` or `jsonl` formats when the complete Shuvscan
+report schema is required.
 
 Native report schema version 1 permits additive optional fields. Consumers must
 ignore fields they do not recognize.
+The native JSON array contract is published at `docs/report.schema.json`; each
+line of JSONL is one report object from that schema's `$defs.report`. Every
+invocation records one `scan_id`, while each target records Unix-millisecond
+`started_at` and `completed_at` collection timestamps.
 
 ### Signed probe packs
 
@@ -128,8 +143,9 @@ an explicit error; probes with a useful but incomplete unprivileged view still
 run and annotate that partial evidence.
 
 Exit codes: `0` clean, `1` findings at or above `--fail-on`,
-`2` usage error, unwritable output, or (with `--strict-collection`) incomplete
-collection.
+`2` usage error, unwritable output, total collector failure, or (with
+`--strict-collection`) any incomplete per-probe collection. A target that was
+not collected is never reported as a pass, even without `--strict-collection`.
 
 ## Current probe pack
 
@@ -165,6 +181,10 @@ severity-based exit code:
 - `sshd -T` (effective SSH config) needs root; unprivileged scans report those
   two probes as *evidence unavailable*. Use `--sudo` when non-interactive sudo
   policy permits the reviewed collector.
+- SSH `Match` blocks depend on connection attributes. The current SSH probes
+  evaluate `sshd -T`'s context-free effective configuration; review conditional
+  policy separately when a deployment relies on `Match User`, `Match Address`,
+  or similar clauses.
 - `/proc/<pid>/exe` links of other users' processes are only readable by root,
   and process/socket/namespace/cgroup visibility can also be restricted by
   `hidepid` or kernel policy. Those unprivileged results are explicitly marked
@@ -180,6 +200,10 @@ severity-based exit code:
   either applies. On ordinary multi-process hosts, process sample limits and
   therefore `truncated: true` are expected. Absence beyond any boundary must not
   be interpreted as proof.
+- The transport retains at most 512 KiB of collector stdout and 4 KiB of
+  stderr per target while continuing to drain excess bytes. Crossing the stdout
+  limit marks the target as a collector failure because the framed transcript
+  may be incomplete.
 - Pack signatures authenticate exact manifest bytes but do not provide
   revocation or rollback protection. Pin the expected pack version in deployment
   configuration and rotate trusted key files when a signer is revoked. Reports

@@ -1,7 +1,4 @@
-use std::{
-    io::{self, Write},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::io::{self, Write};
 
 use serde_json::{Value, json};
 
@@ -52,10 +49,16 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
             )?;
         }
         writeln!(writer, "{}", "-".repeat(72))?;
-        if report.findings.is_empty() {
+        if report.findings.is_empty() && report.errors.is_empty() {
             writeln!(
                 writer,
                 "PASS  No findings detected by the active probe pack."
+            )?;
+        }
+        if !report.errors.is_empty() {
+            writeln!(
+                writer,
+                "INCOMPLETE  Collection errors prevent a complete verdict."
             )?;
         }
         for finding in &report.findings {
@@ -137,10 +140,14 @@ pub fn json(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
 
 pub fn jsonl(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
     for report in reports {
-        serde_json::to_writer(&mut writer, report).map_err(io::Error::from)?;
-        writeln!(writer)?;
+        jsonl_report(report, &mut writer)?;
     }
     Ok(())
+}
+
+pub fn jsonl_report(report: &ScanReport, mut writer: impl Write) -> io::Result<()> {
+    serde_json::to_writer(&mut writer, report).map_err(io::Error::from)?;
+    writeln!(writer)
 }
 
 pub fn sarif(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
@@ -187,6 +194,9 @@ pub fn sarif_with_probes(
                         }]
                     }],
                     "properties": {
+                        "scanId": report.scan_id,
+                        "startedAt": report.started_at,
+                        "completedAt": report.completed_at,
                         "target": report.target,
                         "category": finding.category,
                         "severity": finding.severity.to_string(),
@@ -215,6 +225,7 @@ pub fn sarif_with_probes(
                         "text": format!("{}: {}: {}", report.target, error.probe, error.message)
                     },
                     "properties": {
+                        "scanId": report.scan_id,
                         "target": report.target,
                         "probe": error.probe
                     }
@@ -254,11 +265,11 @@ pub fn sarif_with_probes(
             "toolExecutionNotifications": notifications
         }]
     });
-    if let Some(pack) = reports
-        .first()
-        .and_then(|report| report.probe_pack.as_ref())
-    {
-        run["properties"] = json!({ "probePack": pack });
+    if let Some(report) = reports.first() {
+        run["properties"] = json!({ "scanId": report.scan_id });
+        if let Some(pack) = report.probe_pack.as_ref() {
+            run["properties"]["probePack"] = json!(pack);
+        }
     }
     let log = json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
@@ -271,18 +282,22 @@ pub fn sarif_with_probes(
 }
 
 pub fn ocsf(reports: &[ScanReport], writer: impl Write) -> io::Result<()> {
-    let time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| io::Error::other(format!("system clock is before Unix epoch: {error}")))?
-        .as_millis();
-    let time = u64::try_from(time)
-        .map_err(|_| io::Error::other("system time does not fit an OCSF timestamp"))?;
-    ocsf_at(reports, time, writer)
+    ocsf_with_time(reports, None, writer)
 }
 
+#[cfg(test)]
 fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Result<()> {
+    ocsf_with_time(reports, Some(time), &mut writer)
+}
+
+fn ocsf_with_time(
+    reports: &[ScanReport],
+    fixed_time: Option<u64>,
+    mut writer: impl Write,
+) -> io::Result<()> {
     let mut events = Vec::new();
     for report in reports {
+        let time = fixed_time.unwrap_or(report.completed_at);
         let collection_failed = report.errors.iter().any(|error| error.probe == "collector");
         let activity_id = if collection_failed { 6 } else { 2 };
         let activity_name = if collection_failed {
@@ -318,6 +333,9 @@ fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Res
             "unmapped": {
                 "shuvscan": {
                     "target": report.target,
+                    "scan_id": report.scan_id,
+                    "started_at": report.started_at,
+                    "completed_at": report.completed_at,
                     "collection_errors": errors
                 }
             }
@@ -349,7 +367,7 @@ fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Res
                     }
                 }],
                 "finding_info": {
-                    "uid": format!("{}:{}", report.target, finding.id),
+                    "uid": format!("{}:{}:{}", report.scan_id, report.target, finding.id),
                     "title": finding.title,
                     "desc": finding.description,
                     "types": [finding.category]
@@ -368,6 +386,7 @@ fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Res
                 "unmapped": {
                     "shuvscan": {
                         "target": report.target,
+                        "scan_id": report.scan_id,
                         "rule_id": finding.id
                     }
                 }
@@ -438,6 +457,9 @@ mod tests {
         ScanReport {
             schema_version: 1,
             scanner_version: "0.1.0-test",
+            scan_id: "scan-fixture".into(),
+            started_at: 1_723_000_000_000,
+            completed_at: 1_723_000_000_042,
             probe_pack: None,
             target: "host.example".into(),
             host: Some(HostInfo {
@@ -514,7 +536,7 @@ mod tests {
                 .len(),
             2
         );
-        assert!(run.get("properties").is_none());
+        assert_eq!(run["properties"]["scanId"], "scan-fixture");
     }
 
     #[test]
@@ -527,6 +549,19 @@ mod tests {
 
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("truncated: true"));
+    }
+
+    #[test]
+    fn human_output_never_calls_an_incomplete_scan_a_pass() {
+        let mut report = report();
+        report.findings.clear();
+        let mut output = Vec::new();
+
+        human(&[report], &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("INCOMPLETE"));
+        assert!(!output.contains("PASS"));
     }
 
     #[test]
@@ -635,5 +670,57 @@ mod tests {
         assert_eq!(events[0]["type_uid"], 600706);
         assert_eq!(events[0]["total"], 0);
         assert_eq!(events.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ocsf_uses_the_recorded_collection_time_and_scan_identity() {
+        let report = report();
+        let expected_time = report.completed_at;
+        let expected_uid = format!(
+            "{}:{}:{}",
+            report.scan_id, report.target, report.findings[0].id
+        );
+        let mut output = Vec::new();
+
+        ocsf(&[report], &mut output).unwrap();
+        let events: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(events[0]["time"], expected_time);
+        assert_eq!(events[1]["finding_info"]["uid"], expected_uid);
+    }
+
+    #[test]
+    fn native_json_variants_validate_against_the_published_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../docs/report.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+
+        let finding = report();
+        let mut clean = report();
+        clean.findings.clear();
+        clean.observations.clear();
+        clean.errors.clear();
+        let mut failed = clean.clone();
+        failed.host = None;
+        failed.errors.push(ScanError {
+            probe: "collector",
+            message: "fixture transport failure".into(),
+        });
+        let mut signed = clean.clone();
+        signed.probe_pack = Some(ProbePackInfo {
+            schema_version: 1,
+            id: "org.example.baseline".into(),
+            version: "1.0.0".into(),
+            signer: "example-security".into(),
+        });
+
+        for report in [finding, clean, failed, signed] {
+            let value = serde_json::to_value([report]).unwrap();
+            assert!(
+                validator.is_valid(&value),
+                "schema rejected native report: {:?}",
+                validator.iter_errors(&value).collect::<Vec<_>>()
+            );
+        }
     }
 }

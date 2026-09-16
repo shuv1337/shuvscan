@@ -119,6 +119,9 @@ pub struct ScanError {
 pub struct ScanReport {
     pub schema_version: u8,
     pub scanner_version: &'static str,
+    pub scan_id: String,
+    pub started_at: u64,
+    pub completed_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_pack: Option<ProbePackInfo>,
     pub target: String,

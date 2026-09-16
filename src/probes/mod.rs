@@ -140,7 +140,7 @@ pub static BUILTINS: &[Probe] = &[
         required_tools: &["awk", "sshd"],
         privilege: Privilege::RootRequired,
         script: r#"if cfg=$(sshd -T 2>/dev/null); then
-  printf '%s\n' "$cfg" | awk '$1 == "permitrootlogin" && $2 == "yes"'
+  printf '%s\n' "$cfg" | awk '$1 == "permitrootlogin" && $2 != "no"'
 else
   printf '%s sshd -T failed\n' "$SHUVSCAN_UNAVAILABLE"
 fi"#,
@@ -188,9 +188,11 @@ fi"#,
         category: "persistence",
         description: "A cron file or directory can be modified by any local user, allowing scheduled code execution as root.",
         required_tools: &["find"],
-        privilege: Privilege::Unprivileged,
+        privilege: Privilege::RootRecommended,
         script: r#"for d in /etc/crontab /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly /var/spool/cron; do
-  [ -e "$d" ] && find "$d" -xdev -perm -0002 \( -type f -o -type d \) -print 2>/dev/null
+  if [ -e "$d" ] && ! find "$d" -xdev -perm -0002 \( -type f -o -type d \) -print 2>/dev/null; then
+    printf '%s could not completely inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
+  fi
 done
 :"#,
         kind: ProbeKind::Detection {
@@ -207,7 +209,9 @@ done
         required_tools: &["find"],
         privilege: Privilege::Unprivileged,
         script: r#"for d in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
-  [ -d "$d" ] && ! [ -L "$d" ] && find "$d" -xdev -type f -perm -0002 -print 2>/dev/null
+  if [ -d "$d" ] && ! [ -L "$d" ] && ! find "$d" -xdev -type f -perm -0002 -print 2>/dev/null; then
+    printf '%s could not completely inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
+  fi
 done
 :"#,
         kind: ProbeKind::Detection {
@@ -224,7 +228,9 @@ done
         required_tools: &["find"],
         privilege: Privilege::Unprivileged,
         script: r#"for d in /tmp /var/tmp /dev/shm; do
-  [ -d "$d" ] && find "$d" -xdev \( -perm -4000 -o -perm -2000 \) -type f -print 2>/dev/null
+  if [ -d "$d" ] && ! find "$d" -xdev \( -perm -4000 -o -perm -2000 \) -type f -print 2>/dev/null; then
+    printf '%s could not completely inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
+  fi
 done
 :"#,
         kind: ProbeKind::Detection {
@@ -263,7 +269,9 @@ done
         description: "Kernel pointer restrictions are disabled, weakening exploit mitigations.",
         required_tools: &["cat"],
         privilege: Privilege::Unprivileged,
-        script: "cat /proc/sys/kernel/kptr_restrict 2>/dev/null || :",
+        script: r#"if ! cat /proc/sys/kernel/kptr_restrict 2>/dev/null; then
+  printf '%s /proc/sys/kernel/kptr_restrict is unreadable\n' "$SHUVSCAN_UNAVAILABLE"
+fi"#,
         kind: ProbeKind::Detection {
             severity: Severity::Medium,
             remediation: "Set kernel.kptr_restrict=2 unless a documented workload requires otherwise.",
@@ -277,7 +285,9 @@ done
         description: "Unprivileged users can load BPF programs, expanding kernel attack surface.",
         required_tools: &["cat"],
         privilege: Privilege::Unprivileged,
-        script: "cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || :",
+        script: r#"if ! cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null; then
+  printf '%s /proc/sys/kernel/unprivileged_bpf_disabled is unreadable\n' "$SHUVSCAN_UNAVAILABLE"
+fi"#,
         kind: ProbeKind::Detection {
             severity: Severity::High,
             remediation: "Set kernel.unprivileged_bpf_disabled=1 or 2 and document exceptions.",
@@ -292,7 +302,9 @@ done
         required_tools: &["find"],
         privilege: Privilege::Unprivileged,
         script: r#"for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
-  [ -d "$d" ] && ! [ -L "$d" ] && find "$d" -maxdepth 0 -perm -0002 -print 2>/dev/null
+  if [ -d "$d" ] && ! [ -L "$d" ] && ! find "$d" -maxdepth 0 -perm -0002 -print 2>/dev/null; then
+    printf '%s could not inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
+  fi
 done
 :"#,
         kind: ProbeKind::Detection {
@@ -600,6 +612,33 @@ mod tests {
     }
 
     #[test]
+    fn root_login_probe_flags_every_mode_except_disabled() {
+        for (mode, expected_finding) in [
+            ("no", false),
+            ("yes", true),
+            ("prohibit-password", true),
+            ("forced-commands-only", true),
+        ] {
+            let directory = stub_dir();
+            write_stub(
+                &directory,
+                "sshd",
+                &format!("printf 'permitrootlogin %s\\n' '{mode}'"),
+            );
+            let output = run_with_stubs(probe("SHUV-AUTH-002"), &directory);
+            fs::remove_dir_all(directory).unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+
+            assert!(output.status.success());
+            assert_eq!(
+                !stdout.trim().is_empty(),
+                expected_finding,
+                "{mode}: {stdout}"
+            );
+        }
+    }
+
+    #[test]
     fn silence_is_a_pass_only_for_output_probes() {
         for probe in BUILTINS.iter().filter(|probe| probe.evaluator().is_some()) {
             let evaluate = probe.evaluator().unwrap();
@@ -661,6 +700,39 @@ mod tests {
         assert!(!stdout.contains("owner=unowned"));
         assert!(stdout.contains("UNAVAILABLE:"));
         assert!(!stdout.contains("owner="));
+    }
+
+    #[test]
+    fn unreadable_kernel_controls_are_explicitly_unavailable() {
+        let directory = stub_dir();
+        write_stub(&directory, "cat", "exit 1");
+
+        for id in ["SHUV-KERN-001", "SHUV-KERN-002"] {
+            let output = run_with_stubs(probe(id), &directory);
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(output.status.success());
+            assert!(stdout.contains("UNAVAILABLE:"), "{id}: {stdout}");
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_filesystem_walks_are_explicitly_partial() {
+        let directory = stub_dir();
+        write_stub(&directory, "find", "exit 1");
+
+        for id in [
+            "SHUV-PERSIST-002",
+            "SHUV-FS-001",
+            "SHUV-FS-002",
+            "SHUV-EXEC-001",
+        ] {
+            let output = run_with_stubs(probe(id), &directory);
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(output.status.success());
+            assert!(stdout.contains("PARTIAL:"), "{id}: {stdout}");
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
