@@ -2,6 +2,7 @@ use std::{
     io::{ErrorKind, Read, Write},
     os::unix::process::CommandExt,
     process::{Child, Command, Stdio},
+    sync::Mutex,
     thread,
     time::Duration,
 };
@@ -11,8 +12,10 @@ use wait_timeout::ChildExt;
 
 use crate::model::Target;
 
-const STDOUT_LIMIT: usize = 512 * 1024;
+pub const STDOUT_LIMIT: usize = 512 * 1024;
 const STDERR_LIMIT: usize = 4 * 1024;
+
+static ACTIVE_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -52,6 +55,7 @@ pub fn execute(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let group = ActiveGroup::register(child.id());
 
     // Drain both pipes on threads so a chatty collector can never fill a pipe
     // buffer and deadlock against our stdin write or the timeout wait.
@@ -82,7 +86,7 @@ pub fn execute(
         }
     };
     // A collector must not leave background descendants holding our pipes.
-    terminate_group(child.id());
+    drop(group);
     let write_result = stdin_writer
         .join()
         .unwrap_or_else(|_| Err(std::io::Error::other("collector stdin writer panicked")));
@@ -183,6 +187,64 @@ fn terminate_group(pid: u32) {
 fn reap_group(child: &mut Child) {
     terminate_group(child.id());
     let _ = child.wait();
+}
+
+/// Registration of one collector process group for the lifetime of its
+/// session; dropping it kills the group so nothing outlives the transport.
+struct ActiveGroup(u32);
+
+impl ActiveGroup {
+    fn register(pid: u32) -> Self {
+        active_groups().push(pid);
+        Self(pid)
+    }
+}
+
+impl Drop for ActiveGroup {
+    fn drop(&mut self) {
+        terminate_group(self.0);
+        active_groups().retain(|pid| *pid != self.0);
+    }
+}
+
+fn active_groups() -> std::sync::MutexGuard<'static, Vec<u32>> {
+    ACTIVE_GROUPS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn terminate_active_groups() {
+    let groups = active_groups().clone();
+    for pid in groups {
+        terminate_group(pid);
+    }
+}
+
+/// Route SIGINT and SIGTERM through a watcher thread that kills every in-flight
+/// collector process group before the signal terminates the scanner. Collectors
+/// run in their own groups for timeout containment, so the terminal's job
+/// control no longer reaches them on its own. Call before spawning any thread.
+pub fn forward_interrupts_to_collectors() {
+    // SAFETY: plain libc signal-mask calls on a zero-initialised sigset_t; the
+    // set is built and consumed only through the libc API.
+    unsafe {
+        let mut signals: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut signals);
+        libc::sigaddset(&mut signals, libc::SIGINT);
+        libc::sigaddset(&mut signals, libc::SIGTERM);
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut()) != 0 {
+            return;
+        }
+        thread::spawn(move || {
+            let mut signal = 0;
+            if libc::sigwait(&signals, &mut signal) != 0 {
+                return;
+            }
+            terminate_active_groups();
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut());
+            libc::raise(signal);
+        });
+    }
 }
 
 #[cfg(test)]

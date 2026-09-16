@@ -281,23 +281,10 @@ pub fn sarif_with_probes(
     writeln!(writer)
 }
 
-pub fn ocsf(reports: &[ScanReport], writer: impl Write) -> io::Result<()> {
-    ocsf_with_time(reports, None, writer)
-}
-
-#[cfg(test)]
-fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Result<()> {
-    ocsf_with_time(reports, Some(time), &mut writer)
-}
-
-fn ocsf_with_time(
-    reports: &[ScanReport],
-    fixed_time: Option<u64>,
-    mut writer: impl Write,
-) -> io::Result<()> {
+pub fn ocsf(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
     let mut events = Vec::new();
     for report in reports {
-        let time = fixed_time.unwrap_or(report.completed_at);
+        let time = report.completed_at;
         let collection_failed = report.errors.iter().any(|error| error.probe == "collector");
         let activity_id = if collection_failed { 6 } else { 2 };
         let activity_name = if collection_failed {
@@ -621,9 +608,9 @@ mod tests {
     }
 
     #[test]
-    fn ocsf_emits_scan_and_detection_events_with_fixed_time() {
+    fn ocsf_emits_scan_and_detection_events() {
         let mut output = Vec::new();
-        ocsf_at(&[report()], 1_723_000_000_000, &mut output).unwrap();
+        ocsf(&[report()], &mut output).unwrap();
         let events: Value = serde_json::from_slice(&output).unwrap();
         let events = events.as_array().unwrap();
 
@@ -648,7 +635,7 @@ mod tests {
         assert_eq!(events[1]["severity_id"], 5);
         assert_eq!(events[1]["device"]["hostname"], "fixture-host");
         assert_eq!(events[1]["device"]["type_id"], 0);
-        assert_eq!(events[1]["time"], 1_723_000_000_000_u64);
+        assert_eq!(events[1]["time"], 1_723_000_000_042_u64);
         assert_eq!(events[1]["metadata"]["version"], OCSF_VERSION);
     }
 
@@ -662,7 +649,7 @@ mod tests {
             message: "transport timed out".into(),
         }];
         let mut output = Vec::new();
-        ocsf_at(&[report], 1_723_000_000_000, &mut output).unwrap();
+        ocsf(&[report], &mut output).unwrap();
         let events: Value = serde_json::from_slice(&output).unwrap();
 
         assert_eq!(events[0]["activity_id"], 6);
@@ -722,5 +709,24 @@ mod tests {
                 validator.iter_errors(&value).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn published_schema_accepts_additive_optional_fields() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../docs/report.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let mut value = serde_json::to_value([report()]).unwrap();
+        value[0]["future_field"] = json!("added without a schema_version bump");
+        value[0]["findings"][0]["future_field"] = json!(true);
+        value[0]["host"]["capabilities"]["future_field"] = json!(1);
+
+        assert!(
+            validator.is_valid(&value),
+            "schema must tolerate additive fields: {:?}",
+            validator.iter_errors(&value).collect::<Vec<_>>()
+        );
+        value[0]["schema_version"] = json!(2);
+        assert!(!validator.is_valid(&value));
     }
 }

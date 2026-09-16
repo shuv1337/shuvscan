@@ -2,7 +2,7 @@ use std::{
     num::NonZeroUsize,
     panic::{self, AssertUnwindSafe},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -79,7 +79,10 @@ fn scan_with_context(
             if raw.stdout_truncated {
                 errors.push(ScanError {
                     probe: "collector",
-                    message: "collector stdout exceeded the 524288-byte transport limit; report is incomplete".into(),
+                    message: format!(
+                        "collector stdout exceeded the {}-byte transport limit; report is incomplete",
+                        transport::STDOUT_LIMIT
+                    ),
                 });
             }
             match transcript.sections.get(protocol::CAPABILITIES_ID) {
@@ -286,13 +289,41 @@ pub fn scan_all_unordered_with_probes<E, F>(
     concurrency: NonZeroUsize,
     probes: &[Probe],
     probe_pack: Option<&ProbePackInfo>,
-    mut on_report: F,
+    on_report: F,
 ) -> Result<ScanSummary, (E, ScanSummary)>
 where
     F: FnMut(&ScanReport) -> Result<(), E>,
 {
     let scan_id = new_scan_id();
+    scan_all_unordered_with(
+        targets,
+        concurrency,
+        probes.len(),
+        probe_pack,
+        &scan_id,
+        |target| scan_with_context(target, timeout, sudo, probes, probe_pack, &scan_id),
+        on_report,
+    )
+}
+
+/// Stream reports in completion order. The first `on_report` error stops the
+/// dispatch of further targets; in-flight targets still finish and count toward
+/// the returned summary.
+fn scan_all_unordered_with<E, F, S>(
+    targets: Vec<Target>,
+    concurrency: NonZeroUsize,
+    probes_run: usize,
+    probe_pack: Option<&ProbePackInfo>,
+    scan_id: &str,
+    scan_target: S,
+    mut on_report: F,
+) -> Result<ScanSummary, (E, ScanSummary)>
+where
+    S: Fn(Target) -> ScanReport + Sync,
+    F: FnMut(&ScanReport) -> Result<(), E>,
+{
     let next = AtomicUsize::new(0);
+    let stopped = AtomicBool::new(false);
     let worker_count = concurrency.get().min(targets.len());
     let (sender, receiver) = mpsc::sync_channel(worker_count.max(1));
     let mut summary = ScanSummary::default();
@@ -301,29 +332,31 @@ where
     thread::scope(|scope| {
         for _ in 0..worker_count {
             let sender = sender.clone();
-            let scan_id = &scan_id;
             let next = &next;
+            let stopped = &stopped;
             let targets = &targets;
+            let scan_target = &scan_target;
             scope.spawn(move || {
                 loop {
+                    if stopped.load(Ordering::Acquire) {
+                        break;
+                    }
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(target) = targets.get(index).cloned() else {
                         break;
                     };
                     let label = target.label().to_owned();
                     let started = Instant::now();
-                    let report = panic::catch_unwind(AssertUnwindSafe(|| {
-                        scan_with_context(target, timeout, sudo, probes, probe_pack, scan_id)
-                    }))
-                    .unwrap_or_else(|_| {
-                        panicked_report(
-                            label,
-                            started.elapsed(),
-                            probes.len(),
-                            probe_pack.cloned(),
-                            scan_id.to_owned(),
-                        )
-                    });
+                    let report = panic::catch_unwind(AssertUnwindSafe(|| scan_target(target)))
+                        .unwrap_or_else(|_| {
+                            panicked_report(
+                                label,
+                                started.elapsed(),
+                                probes_run,
+                                probe_pack.cloned(),
+                                scan_id.to_owned(),
+                            )
+                        });
                     if sender.send(report).is_err() {
                         break;
                     }
@@ -335,6 +368,7 @@ where
             summary.include(&report);
             if first_error.is_none() {
                 if let Err(error) = on_report(&report) {
+                    stopped.store(true, Ordering::Release);
                     first_error = Some(error);
                 }
             }
@@ -544,5 +578,45 @@ mod tests {
         );
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].target, "local");
+    }
+
+    #[test]
+    fn unordered_stream_stops_dispatching_after_a_write_failure() {
+        let scanned = Arc::new(AtomicUsize::new(0));
+        let targets = (0..40)
+            .map(|index| Target::Ssh(format!("host-{index:02}")))
+            .collect();
+        let worker_count = 2;
+        let mut delivered = 0;
+
+        let result = scan_all_unordered_with(
+            targets,
+            NonZeroUsize::new(worker_count).unwrap(),
+            BUILTINS.len(),
+            None,
+            "test-scan",
+            {
+                let scanned = Arc::clone(&scanned);
+                move |target| {
+                    scanned.fetch_add(1, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(5));
+                    report(target.label().to_owned())
+                }
+            },
+            |_| {
+                delivered += 1;
+                Err("consumer closed the pipe")
+            },
+        );
+
+        let (error, summary) = result.unwrap_err();
+        assert_eq!(error, "consumer closed the pipe");
+        assert_eq!(delivered, 1);
+        assert!(!summary.collector_failed);
+        let scanned = scanned.load(Ordering::SeqCst);
+        assert!(
+            scanned <= worker_count * 2,
+            "workers kept dispatching after the write failure: {scanned} targets scanned"
+        );
     }
 }

@@ -10,7 +10,6 @@
     },
     "evidence": {
       "type": "object",
-      "additionalProperties": false,
       "required": ["command", "output"],
       "properties": {
         "command": { "type": "string" },
@@ -19,7 +18,6 @@
     },
     "pack": {
       "type": "object",
-      "additionalProperties": false,
       "required": ["schema_version", "id", "version", "signer"],
       "properties": {
         "schema_version": { "const": 1 },
@@ -30,7 +28,6 @@
     },
     "host": {
       "type": "object",
-      "additionalProperties": false,
       "required": ["hostname", "kernel", "os", "capabilities"],
       "properties": {
         "hostname": { "type": "string" },
@@ -38,7 +35,6 @@
         "os": { "type": "string" },
         "capabilities": {
           "type": "object",
-          "additionalProperties": false,
           "required": ["root", "sudo_present", "tools"],
           "properties": {
             "root": { "type": ["boolean", "null"] },
@@ -50,7 +46,6 @@
     },
     "finding": {
       "type": "object",
-      "additionalProperties": false,
       "required": ["id", "title", "severity", "category", "description", "remediation", "evidence"],
       "properties": {
         "id": { "type": "string" },
@@ -64,7 +59,6 @@
     },
     "observation": {
       "type": "object",
-      "additionalProperties": false,
       "required": ["id", "title", "category", "partial", "truncated", "evidence_budget_exceeded", "evidence"],
       "properties": {
         "id": { "type": "string" },
@@ -79,7 +73,6 @@
     },
     "error": {
       "type": "object",
-      "additionalProperties": false,
       "required": ["probe", "message"],
       "properties": {
         "probe": { "type": "string" },
@@ -88,7 +81,6 @@
     },
     "report": {
       "type": "object",
-      "additionalProperties": false,
       "required": ["schema_version", "scanner_version", "scan_id", "started_at", "completed_at", "target", "host", "duration_ms", "probes_run", "findings", "errors"],
       "properties": {
         "schema_version": { "const": 1 },

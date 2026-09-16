@@ -13,6 +13,7 @@ use shuvscan::{
     model::{Severity, Target},
     output, packs,
     probes::BUILTINS,
+    transport,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -79,6 +80,7 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
+    transport::forward_interrupts_to_collectors();
     let cli = Cli::parse();
     if cli.unordered && !matches!(cli.format, Format::Jsonl) {
         eprintln!("shuvscan: --unordered requires --format jsonl");

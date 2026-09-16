@@ -66,7 +66,9 @@ failures are reported as collection errors.
 Fleet scans run at most 16 targets concurrently by default. Set
 `--concurrency <COUNT>` to tune that bound; zero is rejected.
 Timeouts must also be non-zero. A timeout terminates the collector process
-group, including descendants created by a local collector.
+group, including descendants created by a local collector. Interrupting a scan
+with Ctrl-C or SIGTERM terminates every in-flight collector group the same way
+before Shuvscan exits.
 
 By default, reports are sorted by target and buffered until the fleet
 completes. `--format jsonl --unordered` instead writes each target as it

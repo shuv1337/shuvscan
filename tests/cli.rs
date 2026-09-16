@@ -1,9 +1,11 @@
 use std::{
     ffi::OsString,
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::PathBuf,
     sync::atomic::{AtomicUsize, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use assert_cmd::Command;
@@ -24,20 +26,46 @@ struct StubSsh {
 
 impl StubSsh {
     fn failing() -> Self {
+        Self::with_script("#!/bin/sh\nprintf 'fixture connection failure\\n' >&2\nexit 7\n")
+    }
+
+    fn hanging() -> Self {
+        let stub = Self::with_script(
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$SHUVSCAN_STUB_PID_FILE\"\nexec sleep 30\n",
+        );
+        let _ = fs::remove_file(stub.pid_file());
+        stub
+    }
+
+    fn with_script(script: &str) -> Self {
         let id = TEMP_PACK_ID.fetch_add(1, Ordering::Relaxed);
         let directory =
             std::env::temp_dir().join(format!("shuvscan-cli-ssh-{}-{id}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("ssh");
-        fs::write(
-            &path,
-            "#!/bin/sh\nprintf 'fixture connection failure\\n' >&2\nexit 7\n",
-        )
-        .unwrap();
+        fs::write(&path, script).unwrap();
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).unwrap();
         Self { directory }
+    }
+
+    fn pid_file(&self) -> PathBuf {
+        self.directory.join("collector.pid")
+    }
+
+    fn wait_for_collector_pid(&self) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = fs::read_to_string(self.pid_file())
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "stub collector never started");
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn path(&self) -> String {
@@ -235,6 +263,50 @@ fn ocsf_output_is_parseable_and_versioned() {
     assert!(!events.is_empty());
     assert_eq!(events[0]["class_uid"], 6007);
     assert_eq!(events[0]["metadata"]["version"], "1.8.0");
+}
+
+fn process_state(pid: i32) -> Option<char> {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat.rsplit_once(") ").map(|(_, tail)| tail.to_owned()))
+        .and_then(|tail| tail.chars().next())
+}
+
+#[test]
+fn interrupt_terminates_in_flight_collectors() {
+    let stub = StubSsh::hanging();
+    let mut scanner = std::process::Command::new(assert_cmd::cargo::cargo_bin("shuvscan"))
+        .args(["--target", "fixture-host", "--format", "jsonl"])
+        .env("PATH", stub.path())
+        .env("SHUVSCAN_STUB_PID_FILE", stub.pid_file())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let collector = stub.wait_for_collector_pid();
+    assert!(
+        matches!(process_state(collector), Some('S') | Some('R')),
+        "collector should be sleeping before the interrupt"
+    );
+
+    // SAFETY: `scanner` is our own child; the PID is valid until we wait on it.
+    assert_eq!(unsafe { libc::kill(scanner.id() as i32, libc::SIGINT) }, 0);
+    let status = scanner.wait().unwrap();
+
+    assert_eq!(status.signal(), Some(libc::SIGINT));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = process_state(collector);
+        if state.is_none() || state == Some('Z') {
+            break;
+        }
+        if Instant::now() >= deadline {
+            // SAFETY: best-effort cleanup of a fixture process we started.
+            unsafe { libc::kill(collector, libc::SIGKILL) };
+            panic!("collector outlived the interrupted scanner: state {state:?}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]
