@@ -54,6 +54,9 @@
         "category": { "type": "string" },
         "description": { "type": "string" },
         "remediation": { "type": "string" },
+        "evidence_truncated": { "type": "boolean" },
+        "evidence_omitted_bytes": { "type": "integer", "minimum": 0 },
+        "evidence_limit_bytes": { "type": "integer", "minimum": 0 },
         "evidence": { "$ref": "#/$defs/evidence" }
       }
     },

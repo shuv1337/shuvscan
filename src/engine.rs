@@ -10,7 +10,9 @@ use std::{
 };
 
 use crate::{
-    model::{ProbePackInfo, ScanError, ScanReport, Target, truncate_evidence},
+    model::{
+        Finding, Observation, ProbePackInfo, ScanError, ScanReport, Target, truncate_evidence,
+    },
     probes::{BUILTINS, Probe},
     protocol, transport,
 };
@@ -23,13 +25,27 @@ pub struct ScanSummary {
     pub highest_severity: Option<crate::model::Severity>,
     pub collector_failed: bool,
     pub collection_incomplete: bool,
+    pub targets_requested: usize,
+    pub targets_completed: usize,
 }
 
 impl ScanSummary {
+    pub fn for_targets(targets_requested: usize) -> Self {
+        Self {
+            targets_requested,
+            ..Self::default()
+        }
+    }
+
     pub fn include(&mut self, report: &ScanReport) {
+        self.targets_completed += 1;
         self.highest_severity = self.highest_severity.max(report.highest_severity());
         self.collector_failed |= report.errors.iter().any(|error| error.probe == "collector");
         self.collection_incomplete |= !report.errors.is_empty();
+    }
+
+    pub fn coverage_complete(&self) -> bool {
+        self.targets_completed == self.targets_requested
     }
 }
 
@@ -75,6 +91,7 @@ fn scan_with_context(
     }) {
         Ok((nonce, raw)) => {
             let transcript = protocol::parse(&raw.stdout, &nonce);
+            include_os_release_error(&transcript, &mut errors);
             host = transcript.host;
             if raw.stdout_truncated {
                 errors.push(ScanError {
@@ -123,17 +140,16 @@ fn scan_with_context(
                         message: format!("probe exited with status {}", section.status),
                     });
                 } else {
-                    let output = truncate_evidence(section.output.clone(), EVIDENCE_LIMIT);
-                    if let Some(finding) = probe.finding(&section.output, output.clone()) {
-                        findings.push(finding);
-                    }
-                    let evidence_budget_exceeded = section.output.len() > EVIDENCE_LIMIT;
-                    if let Some(observation) = probe.observation(
-                        output,
+                    let (finding, observation) = evaluate_probe_output(
+                        probe,
+                        &section.output,
                         section.partial.clone(),
                         section.collection_limits.clone(),
-                        evidence_budget_exceeded,
-                    ) {
+                    );
+                    if let Some(finding) = finding {
+                        findings.push(finding);
+                    }
+                    if let Some(observation) = observation {
                         observations.push(observation);
                     }
                 }
@@ -166,6 +182,40 @@ fn scan_with_context(
         findings,
         observations,
         errors,
+    }
+}
+
+fn evaluate_probe_output(
+    probe: &Probe,
+    output: &str,
+    partial: Option<String>,
+    collection_limits: Vec<String>,
+) -> (Option<Finding>, Option<Observation>) {
+    let retained_evidence = truncate_evidence(output.to_owned(), EVIDENCE_LIMIT);
+    (
+        probe.finding(output, &retained_evidence),
+        probe.observation(&retained_evidence, partial, collection_limits),
+    )
+}
+
+fn include_os_release_error(transcript: &protocol::Transcript, errors: &mut Vec<ScanError>) {
+    match transcript.sections.get(protocol::OS_RELEASE_ID) {
+        None => errors.push(ScanError {
+            probe: protocol::OS_RELEASE_ID,
+            message: "collector returned no os-release metadata section".into(),
+        }),
+        Some(section) if section.unavailable.is_some() => errors.push(ScanError {
+            probe: protocol::OS_RELEASE_ID,
+            message: format!(
+                "metadata unavailable: {}",
+                section.unavailable.as_deref().unwrap_or_default()
+            ),
+        }),
+        Some(section) if section.status != 0 => errors.push(ScanError {
+            probe: protocol::OS_RELEASE_ID,
+            message: format!("metadata collection exited with status {}", section.status),
+        }),
+        Some(_) => {}
     }
 }
 
@@ -326,7 +376,7 @@ where
     let stopped = AtomicBool::new(false);
     let worker_count = concurrency.get().min(targets.len());
     let (sender, receiver) = mpsc::sync_channel(worker_count.max(1));
-    let mut summary = ScanSummary::default();
+    let mut summary = ScanSummary::for_targets(targets.len());
     let mut first_error = None;
 
     thread::scope(|scope| {
@@ -404,7 +454,7 @@ mod tests {
         probes::{Privilege, ProbeKind},
     };
     use std::sync::{
-        Arc,
+        Arc, Barrier,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -447,12 +497,47 @@ mod tests {
     }
 
     #[test]
+    fn os_release_collection_failures_are_visible() {
+        let mut errors = Vec::new();
+        let missing = protocol::Transcript {
+            host: None,
+            sections: std::collections::HashMap::new(),
+        };
+        include_os_release_error(&missing, &mut errors);
+        assert_eq!(errors[0].probe, protocol::OS_RELEASE_ID);
+        assert_eq!(
+            errors[0].message,
+            "collector returned no os-release metadata section"
+        );
+
+        errors.clear();
+        let unavailable = protocol::Transcript {
+            host: None,
+            sections: std::collections::HashMap::from([(
+                protocol::OS_RELEASE_ID.into(),
+                protocol::Section {
+                    status: 0,
+                    output: String::new(),
+                    unavailable: Some("od is required to read os-release safely".into()),
+                    partial: None,
+                    collection_limits: Vec::new(),
+                },
+            )]),
+        };
+        include_os_release_error(&unavailable, &mut errors);
+        assert_eq!(
+            errors[0].message,
+            "metadata unavailable: od is required to read os-release safely"
+        );
+    }
+
+    #[test]
     fn detections_evaluate_full_output_before_evidence_is_truncated() {
         fn ends_with_signal(output: &str) -> bool {
             output.ends_with("signal")
         }
 
-        let probes = [Probe {
+        let probe = Probe {
             id: "SHUV-TEST-001",
             title: "Large output test",
             category: "test",
@@ -465,13 +550,17 @@ mod tests {
                 remediation: "None.",
                 evaluate: ends_with_signal,
             },
-        }];
+        };
+        let output = format!("{}signal", "x".repeat(EVIDENCE_LIMIT));
 
-        let report = scan_with_probes(Target::Local, Duration::from_secs(10), false, &probes, None);
+        let (finding, observation) = evaluate_probe_output(&probe, &output, None, Vec::new());
 
-        assert!(report.errors.is_empty());
-        assert_eq!(report.findings.len(), 1);
-        assert!(report.findings[0].evidence.output.ends_with("[truncated]"));
+        let finding = finding.expect("full output should raise a finding");
+        assert!(observation.is_none());
+        assert!(finding.evidence.output.ends_with("[truncated]"));
+        assert!(finding.evidence_truncated);
+        assert_eq!(finding.evidence_omitted_bytes, "signal".len());
+        assert_eq!(finding.evidence_limit_bytes, EVIDENCE_LIMIT);
     }
 
     #[test]
@@ -614,9 +703,42 @@ mod tests {
         assert_eq!(delivered, 1);
         assert!(!summary.collector_failed);
         let scanned = scanned.load(Ordering::SeqCst);
+        assert_eq!(summary.targets_requested, 40);
+        assert_eq!(summary.targets_completed, scanned);
+        assert!(!summary.coverage_complete());
         assert!(
             scanned <= worker_count * 2,
             "workers kept dispatching after the write failure: {scanned} targets scanned"
         );
+    }
+
+    #[test]
+    fn unordered_stream_can_finish_coverage_after_a_write_failure() {
+        let ready = Arc::new(Barrier::new(2));
+        let targets = ["host-a", "host-b"]
+            .into_iter()
+            .map(|target| Target::Ssh(target.into()))
+            .collect();
+
+        let result = scan_all_unordered_with(
+            targets,
+            NonZeroUsize::new(2).unwrap(),
+            BUILTINS.len(),
+            None,
+            "test-scan",
+            {
+                let ready = Arc::clone(&ready);
+                move |target| {
+                    ready.wait();
+                    report(target.label().to_owned())
+                }
+            },
+            |_| Err("consumer closed the pipe"),
+        );
+
+        let (_, summary) = result.unwrap_err();
+        assert_eq!(summary.targets_requested, 2);
+        assert_eq!(summary.targets_completed, 2);
+        assert!(summary.coverage_complete());
     }
 }

@@ -161,7 +161,7 @@ The pack is intentionally small and inspectable (`shuvscan --list-probes`):
 | `SHUV-PERSIST-001` | critical | system-wide dynamic linker preload |
 | `SHUV-PERSIST-002` | high | world-writable cron entry |
 | `SHUV-FS-001` | critical | world-writable systemd unit |
-| `SHUV-FS-002` | critical | SUID/SGID binary in /tmp, /var/tmp, or /dev/shm |
+| `SHUV-FS-002` | critical | effective root set-ID executable in /tmp, /var/tmp, or /dev/shm |
 | `SHUV-PROC-001` | medium | process running a deleted executable |
 | `SHUV-KERN-001` | medium | exposed kernel pointers |
 | `SHUV-KERN-002` | high | unprivileged BPF enabled |
@@ -196,6 +196,10 @@ severity-based exit code:
   observations bound TCP and UDP independently.
 - Package ownership is retained in each package manager's native text format;
   use `package_manager` when parsing `owner` values across distributions.
+- Each finding has an 8 KiB retained evidence budget. `evidence_truncated`,
+  `evidence_omitted_bytes`, and `evidence_limit_bytes` preserve completeness
+  when the retained evidence is shortened; human output reports this before its
+  evidence preview.
 - Each observation has collector-specific work bounds and an 8 KiB retained
   evidence budget. `collection_limits` names every collector bound reached;
   `evidence_budget_exceeded` reports byte truncation; `truncated` is true when

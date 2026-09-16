@@ -93,7 +93,18 @@ pub struct Finding {
     pub category: &'static str,
     pub description: &'static str,
     pub remediation: &'static str,
+    pub evidence_truncated: bool,
+    pub evidence_omitted_bytes: usize,
+    pub evidence_limit_bytes: usize,
     pub evidence: Evidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedEvidence {
+    pub output: String,
+    pub truncated: bool,
+    pub omitted_bytes: usize,
+    pub limit_bytes: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -148,11 +159,17 @@ impl ScanReport {
     }
 }
 
-/// Truncate collected evidence to at most `limit` bytes without ever splitting
-/// a UTF-8 code point (`String::truncate` panics on a non-boundary index).
-pub fn truncate_evidence(mut value: String, limit: usize) -> String {
+/// Retain up to `limit` bytes of collected evidence without ever splitting a
+/// UTF-8 code point (`String::truncate` panics on a non-boundary index).
+pub fn truncate_evidence(mut value: String, limit: usize) -> RetainedEvidence {
+    let original_bytes = value.len();
     if value.len() <= limit {
-        return value;
+        return RetainedEvidence {
+            output: value,
+            truncated: false,
+            omitted_bytes: 0,
+            limit_bytes: limit,
+        };
     }
     let mut cut = limit;
     while cut > 0 && !value.is_char_boundary(cut) {
@@ -160,7 +177,12 @@ pub fn truncate_evidence(mut value: String, limit: usize) -> String {
     }
     value.truncate(cut);
     value.push_str("\n[truncated]");
-    value
+    RetainedEvidence {
+        output: value,
+        truncated: true,
+        omitted_bytes: original_bytes - cut,
+        limit_bytes: limit,
+    }
 }
 
 #[cfg(test)]
@@ -170,13 +192,24 @@ mod tests {
     #[test]
     fn truncation_respects_utf8_boundaries() {
         let truncated = truncate_evidence("é".repeat(10), 3);
-        assert!(truncated.starts_with('é'));
-        assert!(truncated.ends_with("[truncated]"));
+        assert!(truncated.output.starts_with('é'));
+        assert!(truncated.output.ends_with("[truncated]"));
+        assert!(truncated.truncated);
+        assert_eq!(truncated.omitted_bytes, 18);
+        assert_eq!(truncated.limit_bytes, 3);
     }
 
     #[test]
     fn truncation_leaves_short_values_untouched() {
-        assert_eq!(truncate_evidence("ok".into(), 16), "ok");
+        assert_eq!(
+            truncate_evidence("ok".into(), 16),
+            RetainedEvidence {
+                output: "ok".into(),
+                truncated: false,
+                omitted_bytes: 0,
+                limit_bytes: 16,
+            }
+        );
     }
 
     #[test]

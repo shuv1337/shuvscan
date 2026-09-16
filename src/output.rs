@@ -69,6 +69,13 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
                 finding.id,
                 finding.title
             )?;
+            if finding.evidence_truncated {
+                writeln!(
+                    writer,
+                    "         evidence truncated: {} byte(s) omitted ({}-byte limit)",
+                    finding.evidence_omitted_bytes, finding.evidence_limit_bytes
+                )?;
+            }
             if !finding.evidence.output.is_empty() {
                 for line in finding.evidence.output.lines().take(4) {
                     writeln!(writer, "         evidence: {}", terminal_safe(line))?;
@@ -124,13 +131,20 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
 fn terminal_safe(value: &str) -> String {
     let mut safe = String::with_capacity(value.len());
     for character in value.chars() {
-        if character.is_control() {
+        if character.is_control() || is_bidi_control(character) {
             safe.extend(character.escape_default());
         } else {
             safe.push(character);
         }
     }
     safe
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 pub fn json(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
@@ -201,6 +215,9 @@ pub fn sarif_with_probes(
                         "category": finding.category,
                         "severity": finding.severity.to_string(),
                         "evidence": finding.evidence.output,
+                        "evidenceTruncated": finding.evidence_truncated,
+                        "evidenceOmittedBytes": finding.evidence_omitted_bytes,
+                        "evidenceLimitBytes": finding.evidence_limit_bytes,
                         "remediation": finding.remediation
                     }
                 });
@@ -374,7 +391,10 @@ pub fn ocsf(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
                     "shuvscan": {
                         "target": report.target,
                         "scan_id": report.scan_id,
-                        "rule_id": finding.id
+                        "rule_id": finding.id,
+                        "evidence_truncated": finding.evidence_truncated,
+                        "evidence_omitted_bytes": finding.evidence_omitted_bytes,
+                        "evidence_limit_bytes": finding.evidence_limit_bytes
                     }
                 }
             });
@@ -468,6 +488,9 @@ mod tests {
                 category: "identity",
                 description: "An account other than root has UID 0.",
                 remediation: "Assign a unique non-zero UID.",
+                evidence_truncated: false,
+                evidence_omitted_bytes: 0,
+                evidence_limit_bytes: 8 * 1024,
                 evidence: Evidence {
                     command: "awk fixture",
                     output: "maintenance:/root:/bin/sh\n".into(),
@@ -539,6 +562,70 @@ mod tests {
     }
 
     #[test]
+    fn human_output_discloses_truncated_findings_before_the_evidence_preview() {
+        let mut report = report();
+        report.findings[0].evidence.output = "one\ntwo\nthree\nfour\n[truncated]".into();
+        report.findings[0].evidence_truncated = true;
+        report.findings[0].evidence_omitted_bytes = 23;
+        let mut output = Vec::new();
+
+        human(&[report], &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        let notice = output.find("evidence truncated:").unwrap();
+        let preview = output.find("evidence: one").unwrap();
+        assert!(notice < preview);
+        assert!(output.contains("evidence truncated: 23 byte(s) omitted (8192-byte limit)"));
+        assert!(!output.contains("[truncated]"));
+    }
+
+    #[test]
+    fn machine_outputs_expose_finding_evidence_completeness() {
+        let mut report = report();
+        report.findings[0].evidence_truncated = true;
+        report.findings[0].evidence_omitted_bytes = 23;
+
+        let mut json_output = Vec::new();
+        json(&[report.clone()], &mut json_output).unwrap();
+        let json_value: Value = serde_json::from_slice(&json_output).unwrap();
+        let native_finding = &json_value[0]["findings"][0];
+        assert_eq!(native_finding["evidence_truncated"], true);
+        assert_eq!(native_finding["evidence_omitted_bytes"], 23);
+        assert_eq!(native_finding["evidence_limit_bytes"], 8 * 1024);
+
+        let mut jsonl_output = Vec::new();
+        jsonl(&[report.clone()], &mut jsonl_output).unwrap();
+        let jsonl_value: Value = serde_json::from_slice(&jsonl_output).unwrap();
+        assert_eq!(jsonl_value["findings"][0]["evidence_truncated"], true);
+
+        let mut sarif_output = Vec::new();
+        sarif(&[report.clone()], &mut sarif_output).unwrap();
+        let sarif_value: Value = serde_json::from_slice(&sarif_output).unwrap();
+        let sarif_properties = &sarif_value["runs"][0]["results"][0]["properties"];
+        assert_eq!(sarif_properties["evidenceTruncated"], true);
+        assert_eq!(sarif_properties["evidenceOmittedBytes"], 23);
+        assert_eq!(sarif_properties["evidenceLimitBytes"], 8 * 1024);
+
+        let mut ocsf_output = Vec::new();
+        ocsf(&[report], &mut ocsf_output).unwrap();
+        let ocsf_value: Value = serde_json::from_slice(&ocsf_output).unwrap();
+        let ocsf_extension = &ocsf_value[1]["unmapped"]["shuvscan"];
+        assert_eq!(ocsf_extension["evidence_truncated"], true);
+        assert_eq!(ocsf_extension["evidence_omitted_bytes"], 23);
+        assert_eq!(ocsf_extension["evidence_limit_bytes"], 8 * 1024);
+    }
+
+    #[test]
+    fn human_output_does_not_flag_complete_finding_evidence() {
+        let mut output = Vec::new();
+
+        human(&[report()], &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("evidence truncated:"));
+    }
+
+    #[test]
     fn human_output_never_calls_an_incomplete_scan_a_pass() {
         let mut report = report();
         report.findings.clear();
@@ -566,6 +653,48 @@ mod tests {
         assert!(output.contains(r"finding=\u{1b}[31mred"));
         assert!(output.contains(r"cmd=\u{1b}[2Jclear"));
         assert!(output.contains(r"tools=awk\u{1b}[2J"));
+    }
+
+    #[test]
+    fn human_output_escapes_unicode_bidi_controls() {
+        const BIDI_CONTROLS: [char; 12] = [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ];
+
+        for character in BIDI_CONTROLS {
+            let mut report = report();
+            report.target = format!("host{character}.example");
+            report.findings[0].evidence.output = format!("finding={character}spoofed");
+            report.errors[0].message = format!("error={character}spoofed");
+            let mut output = Vec::new();
+
+            human(&[report], &mut output).unwrap();
+
+            let output = String::from_utf8(output).unwrap();
+            let escaped = format!(r"\u{{{:x}}}", u32::from(character));
+            assert!(!output.contains(character));
+            assert!(output.contains(&escaped), "missing escape {escaped}");
+        }
+
+        assert_eq!(terminal_safe("café 東京 👩‍💻"), "café 東京 👩‍💻");
+    }
+
+    #[test]
+    fn json_variants_preserve_unicode_bidi_controls() {
+        let mut report = report();
+        report.target = "host\u{202e}\u{2066}.example".into();
+        let expected = report.target.clone();
+
+        let mut json_output = Vec::new();
+        json(&[report.clone()], &mut json_output).unwrap();
+        let json_value: Value = serde_json::from_slice(&json_output).unwrap();
+        assert_eq!(json_value[0]["target"], expected);
+
+        let mut jsonl_output = Vec::new();
+        jsonl(&[report], &mut jsonl_output).unwrap();
+        let jsonl_value: Value = serde_json::from_slice(&jsonl_output).unwrap();
+        assert_eq!(jsonl_value["target"], expected);
     }
 
     #[test]

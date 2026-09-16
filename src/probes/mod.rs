@@ -1,4 +1,4 @@
-use crate::model::{Evidence, Finding, Observation, Severity};
+use crate::model::{Evidence, Finding, Observation, RetainedEvidence, Severity};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Privilege {
@@ -42,7 +42,7 @@ pub struct Probe {
 }
 
 impl Probe {
-    pub fn finding(&self, evaluation_output: &str, evidence_output: String) -> Option<Finding> {
+    pub fn finding(&self, evaluation_output: &str, evidence: &RetainedEvidence) -> Option<Finding> {
         let ProbeKind::Detection {
             severity,
             remediation,
@@ -58,31 +58,33 @@ impl Probe {
             category: self.category,
             description: self.description,
             remediation,
+            evidence_truncated: evidence.truncated,
+            evidence_omitted_bytes: evidence.omitted_bytes,
+            evidence_limit_bytes: evidence.limit_bytes,
             evidence: Evidence {
                 command: self.script,
-                output: evidence_output,
+                output: evidence.output.clone(),
             },
         })
     }
 
     pub fn observation(
         &self,
-        output: String,
+        retained_evidence: &RetainedEvidence,
         partial: Option<String>,
         collection_limits: Vec<String>,
-        evidence_budget_exceeded: bool,
     ) -> Option<Observation> {
         matches!(self.kind, ProbeKind::Evidence).then_some(Observation {
             id: self.id,
             title: self.title,
             category: self.category,
             partial,
-            truncated: evidence_budget_exceeded || !collection_limits.is_empty(),
+            truncated: retained_evidence.truncated || !collection_limits.is_empty(),
             collection_limits,
-            evidence_budget_exceeded,
+            evidence_budget_exceeded: retained_evidence.truncated,
             evidence: Evidence {
                 command: self.script,
-                output,
+                output: retained_evidence.output.clone(),
             },
         })
     }
@@ -209,8 +211,20 @@ done
         required_tools: &["find"],
         privilege: Privilege::Unprivileged,
         script: r#"for d in /etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
-  if [ -d "$d" ] && ! [ -L "$d" ] && ! find "$d" -xdev -type f -perm -0002 -print 2>/dev/null; then
-    printf '%s could not completely inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
+  if [ -d "$d" ]; then
+    if ! find -H "$d" -xdev \( -type f -o -type l \) -exec sh -c '
+      shuvscan_failed=0
+      for shuvscan_unit do
+        if ! find -H "$shuvscan_unit" -xdev \( ! -type f -prune -o -perm -0002 -print \) 2>/dev/null; then
+          shuvscan_failed=1
+        fi
+      done
+      exit "$shuvscan_failed"
+    ' sh {} +; then
+      printf '%s could not completely inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
+    fi
+  elif [ -L "$d" ]; then
+    printf '%s could not resolve %s\n' "$SHUVSCAN_PARTIAL" "$d"
   fi
 done
 :"#,
@@ -222,20 +236,67 @@ done
     },
     Probe {
         id: "SHUV-FS-002",
-        title: "SUID/SGID binary in a temporary directory",
+        title: "Effective root set-ID executable in a temporary directory",
         category: "filesystem",
-        description: "A set-uid or set-gid executable exists in a world-writable temporary directory; no legitimate software installs there.",
+        description: "An executable can assume UID 0 or GID 0 through set-ID bits on a world-writable temporary filesystem.",
         required_tools: &["find"],
         privilege: Privilege::Unprivileged,
         script: r#"for d in /tmp /var/tmp /dev/shm; do
-  if [ -d "$d" ] && ! find "$d" -xdev \( -perm -4000 -o -perm -2000 \) -type f -print 2>/dev/null; then
+  [ -d "$d" ] || continue
+  if [ ! -r /proc/self/mountinfo ]; then
+    printf '%s could not read mount options for %s\n' "$SHUVSCAN_PARTIAL" "$d"
+    continue
+  fi
+  if ! shuvscan_root=$(CDPATH= cd "$d" 2>/dev/null && pwd -P); then
+    printf '%s could not resolve %s\n' "$SHUVSCAN_PARTIAL" "$d"
+    continue
+  fi
+  if ! find "$shuvscan_root" -xdev -type f \
+    \( -perm -0100 -o -perm -0010 -o -perm -0001 \) \
+    \( \( -user 0 -perm -4000 \) -o \( -group 0 -perm -2000 \) \) \
+    -exec sh -c '
+      shuvscan_mount_options_for() {
+        shuvscan_mount_target=$1
+        shuvscan_mount_best=-1
+        shuvscan_mount_result=
+        while IFS=" " read -r shuvscan_mount_id shuvscan_mount_parent shuvscan_mount_device shuvscan_mount_root shuvscan_mount_point shuvscan_mount_options shuvscan_mount_rest; do
+          shuvscan_mount_matches=0
+          if [ "$shuvscan_mount_point" = / ]; then
+            shuvscan_mount_matches=1
+          else
+            case "$shuvscan_mount_target" in
+            "$shuvscan_mount_point"|"$shuvscan_mount_point"/*) shuvscan_mount_matches=1 ;;
+            esac
+          fi
+          if [ "$shuvscan_mount_matches" -eq 1 ] && [ "${#shuvscan_mount_point}" -ge "$shuvscan_mount_best" ]; then
+            shuvscan_mount_best=${#shuvscan_mount_point}
+            shuvscan_mount_result=$shuvscan_mount_options
+          fi
+        done < /proc/self/mountinfo
+        [ "$shuvscan_mount_best" -ge 0 ] || return 1
+        printf "%s\n" "$shuvscan_mount_result"
+      }
+
+      shuvscan_failed=0
+      for shuvscan_candidate do
+        if ! shuvscan_mount_options=$(shuvscan_mount_options_for "$shuvscan_candidate" 2>/dev/null) || [ -z "$shuvscan_mount_options" ]; then
+          shuvscan_failed=1
+          continue
+        fi
+        case ",$shuvscan_mount_options," in
+        *,nosuid,*|*,noexec,*) continue ;;
+        esac
+        printf "%s\n" "$shuvscan_candidate"
+      done
+      exit "$shuvscan_failed"
+    ' sh {} + 2>/dev/null; then
     printf '%s could not completely inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
   fi
 done
 :"#,
         kind: ProbeKind::Detection {
             severity: Severity::Critical,
-            remediation: "Capture the binary for analysis, remove it, and hunt for the process or account that created it.",
+            remediation: "Capture the executable for analysis, remove it, and hunt for the process or account that created it.",
             evaluate: has_output,
         },
     },
@@ -301,9 +362,23 @@ fi"#,
         description: "A standard executable directory is writable by any local user, enabling trivial binary planting.",
         required_tools: &["find"],
         privilege: Privilege::Unprivileged,
-        script: r#"for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
-  if [ -d "$d" ] && ! [ -L "$d" ] && ! find "$d" -maxdepth 0 -perm -0002 -print 2>/dev/null; then
-    printf '%s could not inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
+        script: r#"shuvscan_seen=
+for d in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+  if [ -d "$d" ]; then
+    shuvscan_duplicate=0
+    for shuvscan_previous in $shuvscan_seen; do
+      if [ "$d" -ef "$shuvscan_previous" ]; then
+        shuvscan_duplicate=1
+        break
+      fi
+    done
+    [ "$shuvscan_duplicate" -eq 0 ] || continue
+    shuvscan_seen="$shuvscan_seen $d"
+    if ! find -H "$d" -maxdepth 0 -perm -0002 -print 2>/dev/null; then
+      printf '%s could not inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
+    fi
+  elif [ -L "$d" ]; then
+    printf '%s could not resolve %s as an executable directory\n' "$SHUVSCAN_PARTIAL" "$d"
   fi
 done
 :"#,
@@ -542,7 +617,7 @@ done
 mod tests {
     use std::{
         env, fs,
-        os::unix::fs::PermissionsExt,
+        os::unix::fs::{MetadataExt, PermissionsExt},
         path::{Path, PathBuf},
         process::Command,
         time::{SystemTime, UNIX_EPOCH},
@@ -576,19 +651,86 @@ mod tests {
     }
 
     fn run_with_stubs(probe: &Probe, directory: &Path) -> std::process::Output {
+        run_script_with_stubs(probe.script, directory)
+    }
+
+    fn run_script_with_stubs(script: &str, directory: &Path) -> std::process::Output {
         let path = format!(
             "{}:{}",
             directory.display(),
             env::var("PATH").unwrap_or_default()
         );
         Command::new("sh")
-            .args(["-c", probe.script])
+            .args(["-c", script])
             .env("PATH", path)
             .env("SHUVSCAN_UNAVAILABLE", "UNAVAILABLE:")
             .env("SHUVSCAN_PARTIAL", "PARTIAL:")
             .env("SHUVSCAN_TRUNCATED", "TRUNCATED:")
             .output()
             .unwrap()
+    }
+
+    fn run_systemd_unit_probe(directory: &Path, roots: &[&Path]) -> std::process::Output {
+        const ROOTS: &str =
+            "/etc/systemd/system /run/systemd/system /usr/lib/systemd/system /lib/systemd/system";
+        let roots = roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script = probe("SHUV-FS-001").script.replacen(ROOTS, &roots, 1);
+        assert_ne!(script, probe("SHUV-FS-001").script);
+        run_script_with_stubs(&script, directory)
+    }
+
+    fn run_temp_setid_probe(
+        directory: &Path,
+        root: &Path,
+        mount_options: &str,
+        privileged_uid: u32,
+        privileged_gid: u32,
+    ) -> std::process::Output {
+        let effective_root = fs::canonicalize(root).unwrap();
+        let mountinfo = format!(
+            "1 0 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / {} {mount_options} - tmpfs tmpfs {mount_options}\n",
+            effective_root.display()
+        );
+        run_temp_setid_probe_with_mountinfo(
+            directory,
+            root,
+            &mountinfo,
+            privileged_uid,
+            privileged_gid,
+        )
+    }
+
+    fn run_temp_setid_probe_with_mountinfo(
+        directory: &Path,
+        root: &Path,
+        mountinfo_contents: &str,
+        privileged_uid: u32,
+        privileged_gid: u32,
+    ) -> std::process::Output {
+        const ROOTS: &str = "/tmp /var/tmp /dev/shm";
+        const MOUNTINFO: &str = "/proc/self/mountinfo";
+
+        let mountinfo = directory.join("mountinfo");
+        fs::write(&mountinfo, mountinfo_contents).unwrap();
+        let script = probe("SHUV-FS-002")
+            .script
+            .replacen(ROOTS, root.to_str().unwrap(), 1)
+            .replace(MOUNTINFO, mountinfo.to_str().unwrap())
+            .replace("-user 0", &format!("-user {privileged_uid}"))
+            .replace("-group 0", &format!("-group {privileged_gid}"));
+        assert_ne!(script, probe("SHUV-FS-002").script);
+        run_script_with_stubs(&script, directory)
+    }
+
+    fn write_file_with_mode(path: &Path, mode: u32) {
+        fs::write(path, "fixture\n").unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     #[test]
@@ -677,12 +819,19 @@ mod tests {
         {
             assert!(
                 probe
-                    .finding("arbitrary output", "arbitrary output".into())
+                    .finding(
+                        "arbitrary output",
+                        &crate::model::truncate_evidence("arbitrary output".into(), 1024)
+                    )
                     .is_none()
             );
             assert!(
                 probe
-                    .observation("inventory".into(), None, Vec::new(), false)
+                    .observation(
+                        &crate::model::truncate_evidence("inventory".into(), 1024),
+                        None,
+                        Vec::new()
+                    )
                     .is_some()
             );
         }
@@ -744,18 +893,273 @@ mod tests {
         let directory = stub_dir();
         write_stub(&directory, "find", "exit 1");
 
-        for id in [
-            "SHUV-PERSIST-002",
-            "SHUV-FS-001",
-            "SHUV-FS-002",
-            "SHUV-EXEC-001",
-        ] {
+        for id in ["SHUV-PERSIST-002", "SHUV-FS-001", "SHUV-EXEC-001"] {
             let output = run_with_stubs(probe(id), &directory);
             let stdout = String::from_utf8(output.stdout).unwrap();
             assert!(output.status.success());
             assert!(stdout.contains("PARTIAL:"), "{id}: {stdout}");
         }
+
+        let root = directory.join("temporary-root");
+        fs::create_dir(&root).unwrap();
+        let metadata = fs::metadata(&root).unwrap();
+        let output = run_temp_setid_probe(&directory, &root, "rw", metadata.uid(), metadata.gid());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+        assert!(stdout.contains("PARTIAL:"), "SHUV-FS-002: {stdout}");
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn temp_setid_probe_rejects_manufactured_mode_bits() {
+        let directory = stub_dir();
+        let root = directory.join("temporary-root");
+        fs::create_dir(&root).unwrap();
+        for (name, mode) in [
+            ("ordinary", 0o700),
+            ("self-setuid", 0o4700),
+            ("owned-group-setgid", 0o2750),
+            ("non-executable-setuid", 0o4600),
+            ("non-executable-setgid", 0o2640),
+        ] {
+            write_file_with_mode(&root.join(name), mode);
+        }
+        let metadata = fs::metadata(&root).unwrap();
+        let privileged_uid = u32::from(metadata.uid() == 0);
+        let privileged_gid = u32::from(metadata.gid() == 0);
+
+        let output = run_temp_setid_probe(&directory, &root, "rw", privileged_uid, privileged_gid);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+
+        assert!(output.status.success());
+        assert!(stdout.trim().is_empty(), "{stdout}");
+    }
+
+    #[test]
+    fn temp_setid_probe_reports_effective_root_identity_changes() {
+        let directory = stub_dir();
+        let root = directory.join("temporary-root");
+        fs::create_dir(&root).unwrap();
+        write_file_with_mode(&root.join("root-setuid"), 0o4700);
+        write_file_with_mode(&root.join("root-group-setgid"), 0o2700);
+        let metadata = fs::metadata(&root).unwrap();
+
+        let output = run_temp_setid_probe(&directory, &root, "rw", metadata.uid(), metadata.gid());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+
+        assert!(output.status.success());
+        assert!(stdout.contains("root-setuid"), "{stdout}");
+        assert!(stdout.contains("root-group-setgid"), "{stdout}");
+
+        let different_uid = u32::from(metadata.uid() == 0);
+        let output = run_temp_setid_probe(&directory, &root, "rw", different_uid, metadata.gid());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+        assert!(!stdout.contains("root-setuid"), "{stdout}");
+        assert!(stdout.contains("root-group-setgid"), "{stdout}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn temp_setid_probe_ignores_ineffective_mounts() {
+        let directory = stub_dir();
+        let root = directory.join("temporary-root");
+        fs::create_dir(&root).unwrap();
+        write_file_with_mode(&root.join("root-setuid"), 0o4700);
+        let metadata = fs::metadata(&root).unwrap();
+
+        for mount_options in ["rw,nosuid", "rw,noexec"] {
+            let output = run_temp_setid_probe(
+                &directory,
+                &root,
+                mount_options,
+                metadata.uid(),
+                metadata.gid(),
+            );
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(output.status.success());
+            assert!(stdout.trim().is_empty(), "{mount_options}: {stdout}");
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn temp_setid_probe_checks_each_candidates_effective_mount() {
+        let directory = stub_dir();
+        let root = directory.join("temporary-root");
+        let nested = root.join("nested-bind");
+        fs::create_dir_all(&nested).unwrap();
+        let root_candidate = root.join("root-setuid");
+        let nested_candidate = nested.join("nested-root-setuid");
+        write_file_with_mode(&root_candidate, 0o4700);
+        write_file_with_mode(&nested_candidate, 0o4700);
+        let metadata = fs::metadata(&root).unwrap();
+
+        let mountinfo = format!(
+            "1 0 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / {} rw - tmpfs tmpfs rw\n3 2 0:2 / {} rw,nosuid - tmpfs tmpfs rw,nosuid\n",
+            root.display(),
+            nested.display()
+        );
+        let output = run_temp_setid_probe_with_mountinfo(
+            &directory,
+            &root,
+            &mountinfo,
+            metadata.uid(),
+            metadata.gid(),
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == root_candidate.to_str().unwrap())
+        );
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line == nested_candidate.to_str().unwrap())
+        );
+
+        let mountinfo = format!(
+            "1 0 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / {} rw,nosuid - tmpfs tmpfs rw,nosuid\n3 2 0:2 / {} rw - tmpfs tmpfs rw\n",
+            root.display(),
+            nested.display()
+        );
+        let output = run_temp_setid_probe_with_mountinfo(
+            &directory,
+            &root,
+            &mountinfo,
+            metadata.uid(),
+            metadata.gid(),
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+        assert!(
+            !stdout
+                .lines()
+                .any(|line| line == root_candidate.to_str().unwrap())
+        );
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == nested_candidate.to_str().unwrap())
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn temp_setid_probe_follows_a_symlinked_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = stub_dir();
+        let root = directory.join("effective-root");
+        let root_link = directory.join("temporary-root-link");
+        fs::create_dir(&root).unwrap();
+        symlink(&root, &root_link).unwrap();
+        let candidate = root.join("root-setuid");
+        write_file_with_mode(&candidate, 0o4700);
+        let metadata = fs::metadata(&root).unwrap();
+
+        let output =
+            run_temp_setid_probe(&directory, &root_link, "rw", metadata.uid(), metadata.gid());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+
+        assert!(output.status.success());
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == candidate.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn temp_setid_probe_reports_unknown_mount_options_as_partial() {
+        const ROOTS: &str = "/tmp /var/tmp /dev/shm";
+        const MOUNTINFO: &str = "/proc/self/mountinfo";
+
+        let directory = stub_dir();
+        let root = directory.join("temporary-root");
+        fs::create_dir(&root).unwrap();
+        let missing_mountinfo = directory.join("missing-mountinfo");
+        let script = probe("SHUV-FS-002")
+            .script
+            .replacen(ROOTS, root.to_str().unwrap(), 1)
+            .replace(MOUNTINFO, missing_mountinfo.to_str().unwrap());
+
+        let output = run_script_with_stubs(&script, &directory);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+
+        assert!(output.status.success());
+        assert!(stdout.contains("PARTIAL:"), "{stdout}");
+        assert!(stdout.contains("mount options"), "{stdout}");
+    }
+
+    #[test]
+    fn systemd_unit_probe_checks_symlinked_roots_and_unit_files() {
+        use std::os::unix::fs::symlink;
+
+        let directory = stub_dir();
+        let effective_root = directory.join("effective-root");
+        let lexical_root = directory.join("lexical-root");
+        let outside = directory.join("outside");
+        let linked_directory = directory.join("linked-directory");
+        for path in [&effective_root, &lexical_root, &outside, &linked_directory] {
+            fs::create_dir(path).unwrap();
+        }
+
+        let root_target = effective_root.join("root-link.service");
+        let unit_target = outside.join("unit-link.service");
+        let safe_target = outside.join("safe-link.service");
+        let unrelated_target = linked_directory.join("not-a-unit.service");
+        for path in [&root_target, &unit_target, &safe_target, &unrelated_target] {
+            fs::write(path, "[Service]\n").unwrap();
+        }
+        for path in [&root_target, &unit_target, &unrelated_target] {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o666);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let root_link = directory.join("root-link");
+        symlink(&effective_root, &root_link).unwrap();
+        symlink(&unit_target, lexical_root.join("unit-link.service")).unwrap();
+        symlink(&safe_target, lexical_root.join("safe-link.service")).unwrap();
+        symlink(&linked_directory, lexical_root.join("not-a-unit-directory")).unwrap();
+        symlink("missing.service", lexical_root.join("dangling.service")).unwrap();
+        symlink("/dev/null", lexical_root.join("masked.service")).unwrap();
+
+        let output = run_systemd_unit_probe(&directory, &[&root_link, &lexical_root]);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+
+        assert!(output.status.success());
+        assert!(stdout.contains(root_link.join("root-link.service").to_str().unwrap()));
+        assert!(stdout.contains(lexical_root.join("unit-link.service").to_str().unwrap()));
+        assert!(!stdout.contains("safe-link.service"));
+        assert!(!stdout.contains("not-a-unit.service"));
+        assert!(!stdout.contains("dangling.service"));
+        assert!(!stdout.contains("masked.service"));
+        assert!(!stdout.contains("PARTIAL:"));
+    }
+
+    #[test]
+    fn systemd_unit_probe_reports_symlink_loops_as_partial() {
+        use std::os::unix::fs::symlink;
+
+        let directory = stub_dir();
+        let root = directory.join("root");
+        fs::create_dir(&root).unwrap();
+        symlink("loop.service", root.join("loop.service")).unwrap();
+
+        let output = run_systemd_unit_probe(&directory, &[&root]);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+
+        assert!(output.status.success());
+        assert!(stdout.contains("PARTIAL:"), "{stdout}");
     }
 
     #[test]

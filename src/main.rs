@@ -133,18 +133,10 @@ fn main() -> ExitCode {
             probe_pack,
             |report| output::jsonl_report(report, &mut writer),
         );
-        return match streamed {
-            Ok(summary) => report_exit(summary, cli.strict_collection, cli.fail_on),
-            Err((error, summary)) if error.kind() == io::ErrorKind::BrokenPipe => {
-                report_exit(summary, cli.strict_collection, cli.fail_on)
-            }
-            Err((error, _)) => {
-                eprintln!("shuvscan: could not write report: {error}");
-                ExitCode::from(2)
-            }
-        };
+        return streamed_exit(streamed, cli.strict_collection, cli.fail_on);
     }
 
+    let targets_requested = cli.target.len();
     let reports = engine::scan_all_with_probes(
         cli.target,
         Duration::from_secs(cli.timeout.get()),
@@ -168,11 +160,28 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    let mut summary = engine::ScanSummary::default();
+    let mut summary = engine::ScanSummary::for_targets(targets_requested);
     for report in &reports {
         summary.include(report);
     }
     report_exit(summary, cli.strict_collection, cli.fail_on)
+}
+
+fn streamed_exit(
+    streamed: Result<engine::ScanSummary, (io::Error, engine::ScanSummary)>,
+    strict_collection: bool,
+    fail_on: Severity,
+) -> ExitCode {
+    match streamed {
+        Ok(summary) => report_exit(summary, strict_collection, fail_on),
+        Err((error, summary)) if error.kind() == io::ErrorKind::BrokenPipe => {
+            report_exit(summary, strict_collection, fail_on)
+        }
+        Err((error, _)) => {
+            eprintln!("shuvscan: could not write report: {error}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 fn report_exit(
@@ -180,7 +189,10 @@ fn report_exit(
     strict_collection: bool,
     fail_on: Severity,
 ) -> ExitCode {
-    if summary.collector_failed || (strict_collection && summary.collection_incomplete) {
+    if !summary.coverage_complete()
+        || summary.collector_failed
+        || (strict_collection && summary.collection_incomplete)
+    {
         ExitCode::from(2)
     } else if summary
         .highest_severity
@@ -196,4 +208,56 @@ fn signature_path(manifest: &Path) -> PathBuf {
     let mut path: OsString = manifest.as_os_str().to_owned();
     path.push(".sig");
     path.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(targets_requested: usize, targets_completed: usize) -> engine::ScanSummary {
+        engine::ScanSummary {
+            targets_requested,
+            targets_completed,
+            ..engine::ScanSummary::default()
+        }
+    }
+
+    #[test]
+    fn broken_pipe_with_incomplete_coverage_exits_two() {
+        let streamed = Err((
+            io::Error::new(io::ErrorKind::BrokenPipe, "consumer closed the pipe"),
+            summary(2, 1),
+        ));
+
+        assert_eq!(
+            streamed_exit(streamed, false, Severity::Critical),
+            ExitCode::from(2)
+        );
+    }
+
+    #[test]
+    fn broken_pipe_after_complete_coverage_keeps_scan_result() {
+        let streamed = Err((
+            io::Error::new(io::ErrorKind::BrokenPipe, "consumer closed the pipe"),
+            summary(2, 2),
+        ));
+
+        assert_eq!(
+            streamed_exit(streamed, false, Severity::Critical),
+            ExitCode::SUCCESS
+        );
+    }
+
+    #[test]
+    fn other_stream_write_errors_exit_two() {
+        let streamed = Err((
+            io::Error::new(io::ErrorKind::WriteZero, "could not write report"),
+            summary(2, 2),
+        ));
+
+        assert_eq!(
+            streamed_exit(streamed, false, Severity::Critical),
+            ExitCode::from(2)
+        );
+    }
 }
