@@ -140,7 +140,7 @@ pub static BUILTINS: &[Probe] = &[
         required_tools: &["awk", "sshd"],
         privilege: Privilege::RootRequired,
         script: r#"if cfg=$(sshd -T 2>/dev/null); then
-  printf '%s\n' "$cfg" | awk '$1 == "permitrootlogin" && $2 != "no"'
+  printf '%s\n' "$cfg" | awk 'tolower($1) == "permitrootlogin" && tolower($2) != "no"'
 else
   printf '%s sshd -T failed\n' "$SHUVSCAN_UNAVAILABLE"
 fi"#,
@@ -158,7 +158,7 @@ fi"#,
         required_tools: &["awk", "sshd"],
         privilege: Privilege::RootRequired,
         script: r#"if cfg=$(sshd -T 2>/dev/null); then
-  printf '%s\n' "$cfg" | awk '$1 == "passwordauthentication" && $2 == "yes"'
+  printf '%s\n' "$cfg" | awk 'tolower($1) == "passwordauthentication" && tolower($2) == "yes"'
 else
   printf '%s sshd -T failed\n' "$SHUVSCAN_UNAVAILABLE"
 fi"#,
@@ -636,6 +636,29 @@ mod tests {
                 "{mode}: {stdout}"
             );
         }
+    }
+
+    #[test]
+    fn ssh_probes_match_canonical_case_sshd_keywords() {
+        // OpenSSH 10.x `sshd -T` prints keywords in canonical case
+        // (`PermitRootLogin prohibit-password`); a case-sensitive matcher
+        // would silently report a clean result for an exposed daemon.
+        let directory = stub_dir();
+        write_stub(
+            &directory,
+            "sshd",
+            "printf 'PermitRootLogin prohibit-password\\nPasswordAuthentication yes\\n'",
+        );
+        for id in ["SHUV-AUTH-002", "SHUV-AUTH-003"] {
+            let output = run_with_stubs(probe(id), &directory);
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(output.status.success());
+            assert!(
+                !stdout.trim().is_empty(),
+                "{id} missed canonical-case sshd -T output: {stdout:?}"
+            );
+        }
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
