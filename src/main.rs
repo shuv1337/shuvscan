@@ -1,19 +1,21 @@
 use std::{
     ffi::OsString,
-    io,
+    fs::{self, File, OpenOptions},
+    io::{self, BufWriter, Write},
     num::{NonZeroU64, NonZeroUsize},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode, Stdio},
     time::Duration,
 };
 
 use clap::{Parser, ValueEnum};
 use shuvscan::{
     engine,
-    model::{Severity, Target},
+    model::{ScanReport, Severity, Target},
     output, packs,
-    probes::BUILTINS,
-    transport,
+    probes::{BUILTINS, Probe},
+    transport, tui,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -23,6 +25,8 @@ enum Format {
     Jsonl,
     Sarif,
     Ocsf,
+    Html,
+    Tui,
 }
 
 /// Exit codes: 0 clean, 1 findings at or above --fail-on,
@@ -37,6 +41,14 @@ struct Cli {
     /// Output contract. Machine-readable formats write only data to stdout.
     #[arg(short, long, value_enum, default_value_t = Format::Human)]
     format: Format,
+
+    /// Write the report to PATH instead of stdout. Not valid with --format tui.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Open the HTML report with xdg-open after writing.
+    #[arg(long, requires = "output")]
+    open: bool,
 
     /// Return exit 1 when this severity or higher is found.
     #[arg(long, default_value = "high")]
@@ -82,8 +94,22 @@ struct Cli {
 fn main() -> ExitCode {
     transport::forward_interrupts_to_collectors();
     let cli = Cli::parse();
+    if matches!(cli.format, Format::Tui) {
+        if cli.output.is_some() {
+            eprintln!("shuvscan: --format tui does not support --output");
+            return ExitCode::from(2);
+        }
+        if cli.unordered {
+            eprintln!("shuvscan: --format tui does not support --unordered");
+            return ExitCode::from(2);
+        }
+    }
     if cli.unordered && !matches!(cli.format, Format::Jsonl) {
         eprintln!("shuvscan: --unordered requires --format jsonl");
+        return ExitCode::from(2);
+    }
+    if cli.open && !matches!(cli.format, Format::Html) {
+        eprintln!("shuvscan: --open requires --format html");
         return ExitCode::from(2);
     }
     let verified_pack = match (&cli.probe_pack, &cli.probe_pack_key) {
@@ -121,9 +147,22 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let stdout = io::stdout();
+    if matches!(cli.format, Format::Tui) {
+        if let Err(error) = tui::ensure_interactive() {
+            eprintln!("shuvscan: {error}");
+            return ExitCode::from(2);
+        }
+    }
+
+    let mut writer = match report_writer(cli.output.as_deref(), cli.format) {
+        Ok(writer) => writer,
+        Err(error) => {
+            eprintln!("shuvscan: could not write report: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
     if cli.unordered {
-        let mut writer = stdout.lock();
         let streamed = engine::scan_all_unordered_with_probes(
             cli.target,
             Duration::from_secs(cli.timeout.get()),
@@ -133,6 +172,14 @@ fn main() -> ExitCode {
             probe_pack,
             |report| output::jsonl_report(report, &mut writer),
         );
+        if streamed.is_ok() {
+            if let Err(error) = writer.persist() {
+                if error.kind() != io::ErrorKind::BrokenPipe {
+                    eprintln!("shuvscan: could not write report: {error}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
         return streamed_exit(streamed, cli.strict_collection, cli.fail_on);
     }
 
@@ -145,14 +192,20 @@ fn main() -> ExitCode {
         probes,
         probe_pack,
     );
-    let result = match cli.format {
-        Format::Human => output::human(&reports, stdout.lock()),
-        Format::Json => output::json(&reports, stdout.lock()),
-        Format::Jsonl => output::jsonl(&reports, stdout.lock()),
-        Format::Sarif => output::sarif_with_probes(&reports, probes, stdout.lock()),
-        Format::Ocsf => output::ocsf(&reports, stdout.lock()),
-    };
-    if let Err(error) = result {
+    if matches!(cli.format, Format::Tui) {
+        if let Err(error) = tui::run(&reports) {
+            eprintln!("shuvscan: {error}");
+            return ExitCode::from(2);
+        }
+        let mut summary = engine::ScanSummary::for_targets(targets_requested);
+        for report in &reports {
+            summary.include(report);
+        }
+        return report_exit(summary, cli.strict_collection, cli.fail_on);
+    }
+
+    let result = write_reports(cli.format, &reports, probes, &mut writer);
+    if let Err(error) = result.and_then(|()| writer.persist()) {
         // A consumer closing the pipe early (`shuvscan | head`) is not a
         // scanner failure; still return the severity-based exit code below.
         if error.kind() != io::ErrorKind::BrokenPipe {
@@ -160,11 +213,176 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    if cli.open {
+        if let Some(path) = &cli.output {
+            open_html_report(path);
+        }
+    }
     let mut summary = engine::ScanSummary::for_targets(targets_requested);
     for report in &reports {
         summary.include(report);
     }
     report_exit(summary, cli.strict_collection, cli.fail_on)
+}
+
+enum ReportWriter {
+    Stdout(io::Stdout),
+    File(OutputFile),
+    Sink,
+}
+
+impl Write for ReportWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(writer) => writer.write(buf),
+            Self::File(writer) => writer.write(buf),
+            Self::Sink => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdout(writer) => writer.flush(),
+            Self::File(writer) => writer.flush(),
+            Self::Sink => Ok(()),
+        }
+    }
+}
+
+impl ReportWriter {
+    fn persist(self) -> io::Result<()> {
+        match self {
+            Self::File(file) => file.persist(),
+            Self::Stdout(mut writer) => writer.flush(),
+            Self::Sink => Ok(()),
+        }
+    }
+}
+
+struct OutputFile {
+    inner: BufWriter<File>,
+    tmp_path: PathBuf,
+    dest: PathBuf,
+    persisted: bool,
+}
+
+impl OutputFile {
+    fn create(dest: &Path) -> io::Result<Self> {
+        if dest.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "Is a directory",
+            ));
+        }
+        let file_name = dest.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name")
+        })?;
+        let parent = dest.parent().filter(|path| !path.as_os_str().is_empty());
+        for attempt in 0..16 {
+            let mut tmp_name = file_name.to_os_string();
+            tmp_name.push(format!(".{}.{attempt}.tmp", std::process::id()));
+            let tmp_path = match parent {
+                Some(parent) => parent.join(&tmp_name),
+                None => PathBuf::from(&tmp_name),
+            };
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)
+            {
+                Ok(file) => {
+                    let mut permissions = file.metadata()?.permissions();
+                    permissions.set_mode(0o600);
+                    file.set_permissions(permissions)?;
+                    return Ok(Self {
+                        inner: BufWriter::new(file),
+                        tmp_path,
+                        dest: dest.to_path_buf(),
+                        persisted: false,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create a private temporary report file",
+        ))
+    }
+
+    fn persist(mut self) -> io::Result<()> {
+        self.inner.flush()?;
+        self.inner.get_ref().sync_all()?;
+        fs::rename(&self.tmp_path, &self.dest)?;
+        self.persisted = true;
+        Ok(())
+    }
+}
+
+impl Write for OutputFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Drop for OutputFile {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
+fn report_writer(path: Option<&Path>, format: Format) -> io::Result<ReportWriter> {
+    if matches!(format, Format::Tui) {
+        return Ok(ReportWriter::Sink);
+    }
+    match path {
+        Some(path) => Ok(ReportWriter::File(OutputFile::create(path)?)),
+        None => Ok(ReportWriter::Stdout(io::stdout())),
+    }
+}
+
+fn write_reports(
+    format: Format,
+    reports: &[ScanReport],
+    probes: &[Probe],
+    writer: &mut dyn Write,
+) -> io::Result<()> {
+    match format {
+        Format::Human => output::human(reports, writer),
+        Format::Json => output::json(reports, writer),
+        Format::Jsonl => output::jsonl(reports, writer),
+        Format::Sarif => output::sarif_with_probes(reports, probes, writer),
+        Format::Ocsf => output::ocsf(reports, writer),
+        Format::Html => output::html(reports, writer),
+        Format::Tui => Ok(()),
+    }
+}
+
+fn open_html_report(path: &Path) {
+    let absolute = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("shuvscan: could not open report: {error}");
+            return;
+        }
+    };
+    if let Err(error) = Command::new("xdg-open")
+        .arg(&absolute)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        eprintln!("shuvscan: could not open report: {error}");
+    }
 }
 
 fn streamed_exit(
@@ -213,6 +431,7 @@ fn signature_path(manifest: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn summary(targets_requested: usize, targets_completed: usize) -> engine::ScanSummary {
         engine::ScanSummary {
@@ -259,5 +478,55 @@ mod tests {
             streamed_exit(streamed, false, Severity::Critical),
             ExitCode::from(2)
         );
+    }
+
+    #[test]
+    fn report_file_stays_private_and_replaces_atomically() {
+        let directory = std::env::temp_dir().join(format!(
+            "shuvscan-main-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let dest = directory.join("report.html");
+        fs::write(&dest, "OLD").unwrap();
+
+        let mut file = OutputFile::create(&dest).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "OLD");
+        file.write_all(b"NEW").unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "OLD");
+        file.persist().unwrap();
+
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "NEW");
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn report_file_drop_leaves_destination_untouched() {
+        let directory = std::env::temp_dir().join(format!(
+            "shuvscan-main-drop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let dest = directory.join("report.html");
+        fs::write(&dest, "OLD").unwrap();
+
+        let mut file = OutputFile::create(&dest).unwrap();
+        file.write_all(b"NEW").unwrap();
+        let tmp_path = file.tmp_path.clone();
+        drop(file);
+
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "OLD");
+        assert!(!tmp_path.exists());
+        let _ = fs::remove_dir_all(&directory);
     }
 }

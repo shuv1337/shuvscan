@@ -25,7 +25,7 @@ or settle for a shallow configuration checklist. Shuvscan's goal is a third opti
   collection failures.
 - **Fleet-native.** Parallel targets, deterministic reports, baselines, drift, and eventually a
   local-first evidence graph.
-- **Automation-native.** Human output for terminals; JSON, NDJSON, SARIF, and OCSF for integrations.
+- **Automation-native.** Human output for terminals; JSON, NDJSON, SARIF, OCSF, HTML, and a keyboard-driven TUI.
 - **Safe defaults.** Read-only probes, strict host-key checking, batch-mode SSH, no curl-pipe-shell
   installer, and no hidden telemetry.
 
@@ -53,6 +53,12 @@ cargo build --release
 
 # Opt in to bounded, non-interactive privilege escalation of the collector.
 ./target/release/shuvscan --target ops@host --sudo
+
+# Write a self-contained HTML report and open it.
+./target/release/shuvscan --format html --output report.html --open
+
+# Review findings in a keyboard-driven terminal viewer.
+./target/release/shuvscan --format tui
 ```
 
 Shuvscan never accepts passwords on the command line. Configure keys, host aliases, bastions, and
@@ -86,6 +92,21 @@ in the Scan Activity's `unmapped.shuvscan.observations_json` extension. OCSF
 the invocation's scan ID. SARIF run and result properties carry the same scan
 identity. Use the native `json` or `jsonl` formats when the complete Shuvscan
 report schema is required.
+
+`--format html` writes a self-contained HTML report with inline CSS, no
+JavaScript, and no external resources. Host-derived strings are sanitized and
+HTML-escaped. Collection errors produce an INCOMPLETE verdict; PASS is reserved
+for complete scans with no findings. `--output PATH` writes any non-TUI format
+to a private file (mode 0600), replacing the destination atomically after a
+successful write, and leaves stdout empty. `--open` requires `--format html` and
+`--output`; it launches the report with `xdg-open` and does not wait. A missing
+`xdg-open` is reported on stderr without changing the scan exit code.
+
+`--format tui` is a keyboard-driven viewer for completed reports. It requires
+an interactive terminal and rejects `--output` and `--unordered`. Keys: `j`/`k`
+or up/down move; Enter or Space expand; Tab, `h`/`l`, left/right, or `[`/`]`
+change targets; `g`/`G` first/last row; PgUp/PgDn page; `?` help; `q`, Esc, or
+Ctrl-C quit. Long rows wrap; chrome that cannot wrap is marked with `…`.
 
 Native report schema version 1 permits additive optional fields. Consumers must
 ignore fields they do not recognize.
