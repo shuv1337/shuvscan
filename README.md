@@ -297,6 +297,21 @@ Design constraints:
 - New findings require a stable ID, remediation, collector behavior tests, evaluator tests, and
   safe/unsafe fixtures.
 
+### Releasing
+
+Releases are cut by pushing a `v*` tag that matches the `version` in `Cargo.toml`
+(`.github/workflows/release.yml` fails otherwise). The workflow builds fully static musl binaries
+for `x86_64` and `aarch64` Linux, smoke-tests `--version`, packages each as
+`shuvscan-vX.Y.Z-<target>.tar.gz` with `LICENSE`, `README.md`, and `SECURITY.md`, verifies
+per-artifact SHA-256 checksums, and publishes a GitHub release with a combined `SHA256SUMS` and
+auto-generated notes.
+
+```bash
+# After bumping Cargo.toml and landing it on main:
+git tag -a vX.Y.Z -m "shuvscan vX.Y.Z" <merge-commit>
+git push origin vX.Y.Z
+```
+
 ## Status
 
 `0.1.0` is the walking skeleton: a useful local scanner and a trustworthy set of seams. Next work
