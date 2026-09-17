@@ -1,0 +1,60 @@
+name: notify-discord
+
+# Invoked by release.yml after a successful cut, or dispatched by hand for a
+# backfill. Do not use on.release: releases created with GITHUB_TOKEN do not
+# start other workflows, so that trigger would never fire for our release path.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Released tag (e.g. v0.1.0)"
+        required: true
+        type: string
+    secrets:
+      DISCORD_RELEASE_WEBHOOK_URL:
+        required: false
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Released tag (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Post release to Discord
+        continue-on-error: true
+        env:
+          DISCORD_RELEASE_WEBHOOK_URL: ${{ secrets.DISCORD_RELEASE_WEBHOOK_URL }}
+          VERSION: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DISCORD_RELEASE_WEBHOOK_URL:-}" ]; then
+            echo "DISCORD_RELEASE_WEBHOOK_URL unset; skipping Discord notify"
+            exit 0
+          fi
+          TAG="$VERSION"
+          case "$TAG" in
+            v*) ;;
+            *) TAG="v$TAG" ;;
+          esac
+          CONTENT="$(printf '%s\n%s\n%s' \
+            "**shuvscan ${TAG}** is out" \
+            "release: https://github.com/${REPO}/releases/tag/${TAG}" \
+            "tag: https://github.com/${REPO}/tree/${TAG}")"
+          PAYLOAD="$(CONTENT="$CONTENT" python3 -c 'import json, os; print(json.dumps({"content": os.environ["CONTENT"]}))')"
+          code="$(curl -sS -o /tmp/discord-notify-body -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$DISCORD_RELEASE_WEBHOOK_URL" || true)"
+          if [ "$code" != "204" ] && [ "$code" != "200" ]; then
+            echo "Discord announce failed (non-fatal): HTTP ${code}"
+            exit 0
+          fi
