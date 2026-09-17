@@ -77,8 +77,16 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
                 )?;
             }
             if !finding.evidence.output.is_empty() {
+                let line_count = finding.evidence.output.lines().count();
                 for line in finding.evidence.output.lines().take(4) {
                     writeln!(writer, "         evidence: {}", terminal_safe(line))?;
+                }
+                if line_count > 4 {
+                    writeln!(
+                        writer,
+                        "         evidence: ... {} more line(s); use --format json for the full evidence",
+                        line_count - 4
+                    )?;
                 }
             }
             writeln!(writer, "         fix: {}", finding.remediation)?;
@@ -577,6 +585,29 @@ mod tests {
         assert!(notice < preview);
         assert!(output.contains("evidence truncated: 23 byte(s) omitted (8192-byte limit)"));
         assert!(!output.contains("[truncated]"));
+    }
+
+    #[test]
+    fn human_output_discloses_finding_evidence_lines_beyond_the_preview() {
+        let mut report = report();
+        report.findings[0].evidence.output = "one\ntwo\nthree\nfour\nfive\nsix".into();
+        let mut output = Vec::new();
+
+        human(&[report], &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("evidence: four\n"));
+        assert!(!output.contains("evidence: five"));
+        assert!(!output.contains("evidence: six"));
+        assert!(output.contains("evidence: ... 2 more line(s); use --format json"));
+
+        let mut exact = self::report();
+        exact.findings[0].evidence.output = "one\ntwo\nthree\nfour".into();
+        let mut output = Vec::new();
+        human(&[exact], &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("evidence: four\n"));
+        assert!(!output.contains("more line(s)"));
     }
 
     #[test]

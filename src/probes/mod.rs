@@ -119,6 +119,40 @@ fn is_zero(output: &str) -> bool {
     output.trim() == "0"
 }
 
+/// Shared bounded process sampler used by the `/proc`-walking evidence probes.
+/// Leaves `$shuvscan_pids` holding the 12 lowest and 12 highest live user-space
+/// PIDs plus a trailing `SHUVSCAN_MORE` sentinel when the host has more.
+///
+/// Kernel threads (`PF_KTHREAD` in the `/proc/<pid>/stat` flags field) and
+/// zombies have no executable, command line, or namespaces worth retaining;
+/// sampling them only manufactured `skipped_unreadable_*` partials on every
+/// root scan because their `exe` links do not exist. A `stat` that cannot be
+/// read keeps the PID in the sample so the probe reports it as unreadable.
+///
+/// Expands to `concat!($before, <sampler>, $after)` so each probe script stays
+/// one `&'static str`.
+macro_rules! with_process_sample {
+    ($before:literal, $after:literal) => {
+        concat!(
+            $before,
+            r#"shuvscan_pids=$(for shuvscan_path in /proc/[0-9]*; do
+  if IFS= read -r shuvscan_stat < "$shuvscan_path/stat"; then
+    shuvscan_stat=${shuvscan_stat##*') '}
+    set -f
+    set -- $shuvscan_stat
+    set +f
+    case "$1" in Z) continue ;; esac
+    case "$7" in ''|*[!0-9]*) ;; *) [ $(( ($7 / 2097152) % 2 )) -eq 0 ] || continue ;; esac
+  elif [ ! -d "$shuvscan_path" ]; then
+    continue
+  fi
+  printf '%s\n' "${shuvscan_path#/proc/}"
+done 2>/dev/null | sort -n | awk 'NR <= 12 {low[NR]=$0} {high[(NR-1)%12]=$0} END {for(i=1;i<=NR && i<=12;i++) print low[i]; start=NR-11; if(start<13) start=13; for(i=start;i<=NR;i++) print high[(i-1)%12]; if(NR>24) print "SHUVSCAN_MORE"}')"#,
+            $after
+        )
+    };
+}
+
 pub static BUILTINS: &[Probe] = &[
     Probe {
         id: "SHUV-AUTH-001",
@@ -233,7 +267,7 @@ done
         title: "Effective root set-ID executable in a temporary directory",
         category: "filesystem",
         description: "An executable can assume UID 0 or GID 0 through set-ID bits on a world-writable temporary filesystem.",
-        required_tools: &["find"],
+        required_tools: &["awk", "find"],
         privilege: Privilege::Unprivileged,
         script: r#"for d in /tmp /var/tmp /dev/shm; do
   [ -d "$d" ] || continue
@@ -245,7 +279,8 @@ done
     printf '%s could not resolve %s\n' "$SHUVSCAN_PARTIAL" "$d"
     continue
   fi
-  if ! find "$shuvscan_root" -xdev -type f \
+  exec 3>&1
+  shuvscan_find_errors=$(find "$shuvscan_root" -xdev -type f \
     \( -perm -0100 -o -perm -0010 -o -perm -0001 \) \
     \( \( -user 0 -perm -4000 \) -o \( -group 0 -perm -2000 \) \) \
     -exec sh -c '
@@ -283,8 +318,45 @@ done
         esac
         printf "%s\n" "$shuvscan_candidate"
       done
+      [ "$shuvscan_failed" -eq 0 ] || printf "shuvscan: could not resolve mount options for every candidate\n" >&2
       exit "$shuvscan_failed"
-    ' sh {} + 2>/dev/null; then
+    ' sh {} + 2>&1 1>&3 3>&-)
+  shuvscan_find_status=$?
+  exec 3>&-
+  [ "$shuvscan_find_status" -ne 0 ] || continue
+  if [ -z "$shuvscan_find_errors" ]; then
+    printf '%s could not completely inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
+    continue
+  fi
+  if ! shuvscan_unexplained=$(SHUVSCAN_ROOT="$shuvscan_root" SHUVSCAN_FIND_ERRORS="$shuvscan_find_errors" awk '
+    {
+      mp = $5
+      out = ""
+      while (match(mp, /\\[0-7][0-7][0-7]/)) {
+        out = out substr(mp, 1, RSTART - 1)
+        code = substr(mp, RSTART + 1, 3)
+        val = 0
+        for (i = 1; i <= 3; i++) val = val * 8 + (substr(code, i, 1) + 0)
+        out = out sprintf("%c", val)
+        mp = substr(mp, RSTART + 4)
+      }
+      mounts[out mp] = 1
+    }
+    END {
+      root = ENVIRON["SHUVSCAN_ROOT"]
+      n = split(ENVIRON["SHUVSCAN_FIND_ERRORS"], lines, "\n")
+      for (i = 1; i <= n; i++) {
+        line = lines[i]
+        if (line == "") continue
+        if (substr(line, 1, 6) != "find: " || substr(line, length(line) - 18) != ": Permission denied") {
+          print line
+          continue
+        }
+        path = substr(line, 7, length(line) - 25)
+        if (substr(path, 1, 1) == "\047" && substr(path, length(path)) == "\047") path = substr(path, 2, length(path) - 2)
+        if (substr(path, 1, length(root) + 1) != root "/" || !(path in mounts)) print line
+      }
+    }' /proc/self/mountinfo) || [ -n "$shuvscan_unexplained" ]; then
     printf '%s could not completely inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
   fi
 done
@@ -390,7 +462,8 @@ done
         description: "Maps a bounded sample of running executable paths to the owning dpkg, RPM, apk, or pacman package.",
         required_tools: &["awk", "readlink", "sort", "tr"],
         privilege: Privilege::RootRecommended,
-        script: r#"shuvscan_package_manager=
+        script: with_process_sample!(
+            r#"shuvscan_package_manager=
 if command -v dpkg-query >/dev/null 2>&1; then
   shuvscan_manager_path=$(command -v dpkg-query)
   dpkg-query -S -- "$shuvscan_manager_path" >/dev/null 2>&1 && shuvscan_package_manager=dpkg
@@ -417,14 +490,15 @@ printf 'package_manager=%s\n' "$shuvscan_package_manager"
   exit 0
 }
 shuvscan_skipped=0
-shuvscan_pids=$(for shuvscan_path in /proc/[0-9]*; do printf '%s\n' "${shuvscan_path#/proc/}"; done | sort -n | awk 'NR <= 12 {low[NR]=$0} {high[(NR-1)%12]=$0} END {for(i=1;i<=NR && i<=12;i++) print low[i]; start=NR-11; if(start<13) start=13; for(i=start;i<=NR;i++) print high[(i-1)%12]; if(NR>24) print "SHUVSCAN_MORE"}')
+"#,
+            r#"
 for shuvscan_pid in $shuvscan_pids; do
   if [ "$shuvscan_pid" = SHUVSCAN_MORE ]; then
     printf '%s low_high_process_sample=24\n' "$SHUVSCAN_TRUNCATED"
     break
   fi
   shuvscan_target=$(readlink "/proc/$shuvscan_pid/exe" 2>/dev/null) || {
-    shuvscan_skipped=$((shuvscan_skipped + 1))
+    [ ! -d "/proc/$shuvscan_pid" ] || shuvscan_skipped=$((shuvscan_skipped + 1))
     continue
   }
   shuvscan_deleted=0
@@ -448,7 +522,8 @@ for shuvscan_pid in $shuvscan_pids; do
   printf 'pid=%s\tdeleted=%s\texe=%s\towner=%s\n' "$shuvscan_pid" "$shuvscan_deleted" "$shuvscan_target" "$shuvscan_owner"
 done
 [ "$shuvscan_skipped" -eq 0 ] || printf '%s skipped_unreadable_processes=%s\n' "$SHUVSCAN_PARTIAL" "$shuvscan_skipped"
-:"#,
+:"#
+        ),
         kind: ProbeKind::Evidence,
     },
     Probe {
@@ -458,12 +533,14 @@ done
         description: "Records PID, parent PID, real and effective UIDs, name, and command line for a bounded process sample.",
         required_tools: &["awk", "sort", "tr"],
         privilege: Privilege::RootRecommended,
-        script: r#"[ -d /proc ] || {
+        script: with_process_sample!(
+            r#"[ -d /proc ] || {
   printf '%s /proc is unavailable\n' "$SHUVSCAN_UNAVAILABLE"
   exit 0
 }
 shuvscan_skipped=0
-shuvscan_pids=$(for shuvscan_path in /proc/[0-9]*; do printf '%s\n' "${shuvscan_path#/proc/}"; done | sort -n | awk 'NR <= 12 {low[NR]=$0} {high[(NR-1)%12]=$0} END {for(i=1;i<=NR && i<=12;i++) print low[i]; start=NR-11; if(start<13) start=13; for(i=start;i<=NR;i++) print high[(i-1)%12]; if(NR>24) print "SHUVSCAN_MORE"}')
+"#,
+            r#"
 for shuvscan_pid in $shuvscan_pids; do
   if [ "$shuvscan_pid" = SHUVSCAN_MORE ]; then
     printf '%s low_high_process_sample=24\n' "$SHUVSCAN_TRUNCATED"
@@ -471,7 +548,7 @@ for shuvscan_pid in $shuvscan_pids; do
   fi
   shuvscan_status=/proc/$shuvscan_pid/status
   if [ ! -r "$shuvscan_status" ]; then
-    shuvscan_skipped=$((shuvscan_skipped + 1))
+    [ ! -d "/proc/$shuvscan_pid" ] || shuvscan_skipped=$((shuvscan_skipped + 1))
     continue
   fi
   shuvscan_name=$(awk '$1 == "Name:" {sub(/^[^:]*:[[:space:]]*/, ""); print; exit}' "$shuvscan_status" 2>/dev/null | tr '\n\t' '  ')
@@ -488,7 +565,8 @@ for shuvscan_pid in $shuvscan_pids; do
   printf 'pid=%s\tppid=%s\truid=%s\teuid=%s\tname=%s\tcmd=%s\n' "$shuvscan_pid" "$shuvscan_ppid" "$shuvscan_ruid" "$shuvscan_euid" "$shuvscan_name" "$shuvscan_cmd"
 done
 [ "$shuvscan_skipped" -eq 0 ] || printf '%s skipped_unreadable_files=%s\n' "$SHUVSCAN_PARTIAL" "$shuvscan_skipped"
-:"#,
+:"#
+        ),
         kind: ProbeKind::Evidence,
     },
     Probe {
@@ -527,12 +605,14 @@ fi
         description: "Records namespace identities for a bounded process sample so isolation boundaries can be correlated.",
         required_tools: &["awk", "readlink", "sort", "tr"],
         privilege: Privilege::RootRecommended,
-        script: r#"if [ ! -d /proc/self/ns ]; then
+        script: with_process_sample!(
+            r#"if [ ! -d /proc/self/ns ]; then
   printf '%s Linux namespace links are unavailable\n' "$SHUVSCAN_UNAVAILABLE"
   exit 0
 fi
 shuvscan_skipped=0
-shuvscan_pids=$(for shuvscan_path in /proc/[0-9]*; do printf '%s\n' "${shuvscan_path#/proc/}"; done | sort -n | awk 'NR <= 12 {low[NR]=$0} {high[(NR-1)%12]=$0} END {for(i=1;i<=NR && i<=12;i++) print low[i]; start=NR-11; if(start<13) start=13; for(i=start;i<=NR;i++) print high[(i-1)%12]; if(NR>24) print "SHUVSCAN_MORE"}')
+"#,
+            r#"
 for shuvscan_pid in $shuvscan_pids; do
   if [ "$shuvscan_pid" = SHUVSCAN_MORE ]; then
     printf '%s low_high_process_sample=24\n' "$SHUVSCAN_TRUNCATED"
@@ -540,7 +620,7 @@ for shuvscan_pid in $shuvscan_pids; do
   fi
   shuvscan_nsdir=/proc/$shuvscan_pid/ns
   shuvscan_mnt=$(readlink "$shuvscan_nsdir/mnt" 2>/dev/null) || {
-    shuvscan_skipped=$((shuvscan_skipped + 1))
+    [ ! -d "/proc/$shuvscan_pid" ] || shuvscan_skipped=$((shuvscan_skipped + 1))
     continue
   }
   shuvscan_mnt=$(printf '%s' "$shuvscan_mnt" | tr '\n\t' '  ')
@@ -558,7 +638,8 @@ for shuvscan_pid in $shuvscan_pids; do
   printf 'pid=%s\tmnt=%s\tpidns=%s\tnet=%s\tuser=%s\tuts=%s\tipc=%s\n' "$shuvscan_pid" "$shuvscan_mnt" "$shuvscan_pidns" "$shuvscan_net" "$shuvscan_user" "$shuvscan_uts" "$shuvscan_ipc"
 done
 [ "$shuvscan_skipped" -eq 0 ] || printf '%s skipped_unreadable_namespaces=%s\n' "$SHUVSCAN_PARTIAL" "$shuvscan_skipped"
-:"#,
+:"#
+        ),
         kind: ProbeKind::Evidence,
     },
     Probe {
@@ -568,7 +649,8 @@ done
         description: "Records host container markers and bounded process cgroup memberships without entering namespaces.",
         required_tools: &["awk", "sort", "tr"],
         privilege: Privilege::RootRecommended,
-        script: r#"[ ! -e /.dockerenv ] || printf 'host_marker=/.dockerenv\n'
+        script: with_process_sample!(
+            r#"[ ! -e /.dockerenv ] || printf 'host_marker=/.dockerenv\n'
 [ ! -e /run/.containerenv ] || printf 'host_marker=/run/.containerenv\n'
 if [ -r /proc/1/cgroup ]; then
   awk 'NR <= 32 {print "pid1_cgroup=" $0} NR == 33 {exit 42}' /proc/1/cgroup 2>/dev/null
@@ -587,7 +669,8 @@ shuvscan_skipped=0
   printf '%s /proc is unavailable\n' "$SHUVSCAN_PARTIAL"
   exit 0
 }
-shuvscan_pids=$(for shuvscan_path in /proc/[0-9]*; do printf '%s\n' "${shuvscan_path#/proc/}"; done | sort -n | awk 'NR <= 12 {low[NR]=$0} {high[(NR-1)%12]=$0} END {for(i=1;i<=NR && i<=12;i++) print low[i]; start=NR-11; if(start<13) start=13; for(i=start;i<=NR;i++) print high[(i-1)%12]; if(NR>24) print "SHUVSCAN_MORE"}')
+"#,
+            r#"
 for shuvscan_pid in $shuvscan_pids; do
   if [ "$shuvscan_pid" = SHUVSCAN_MORE ]; then
     printf '%s low_high_process_sample=24\n' "$SHUVSCAN_TRUNCATED"
@@ -595,7 +678,7 @@ for shuvscan_pid in $shuvscan_pids; do
   fi
   shuvscan_cgroup=/proc/$shuvscan_pid/cgroup
   if [ ! -r "$shuvscan_cgroup" ]; then
-    shuvscan_skipped=$((shuvscan_skipped + 1))
+    [ ! -d "/proc/$shuvscan_pid" ] || shuvscan_skipped=$((shuvscan_skipped + 1))
     continue
   fi
   shuvscan_membership=$(tr '\n\t' '; ' < "$shuvscan_cgroup" 2>/dev/null)
@@ -603,7 +686,8 @@ for shuvscan_pid in $shuvscan_pids; do
   printf 'pid=%s\tcgroup=%s\n' "$shuvscan_pid" "$shuvscan_membership"
 done
 [ "$shuvscan_skipped" -eq 0 ] || printf '%s skipped_unreadable_cgroups=%s\n' "$SHUVSCAN_PARTIAL" "$shuvscan_skipped"
-:"#,
+:"#
+        ),
         kind: ProbeKind::Evidence,
     },
 ];
@@ -658,6 +742,7 @@ mod tests {
         Command::new("sh")
             .args(["-c", script])
             .env("PATH", path)
+            .env("LC_ALL", "C")
             .env("SHUVSCAN_UNAVAILABLE", "UNAVAILABLE:")
             .env("SHUVSCAN_PARTIAL", "PARTIAL:")
             .env("SHUVSCAN_TRUNCATED", "TRUNCATED:")
@@ -902,6 +987,75 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(output.status.success());
         assert!(stdout.contains("PARTIAL:"), "SHUV-FS-002: {stdout}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn temp_setid_probe_tolerates_unreadable_nested_mount_points() {
+        let directory = stub_dir();
+        let root = directory.join("temporary-root");
+        fs::create_dir(&root).unwrap();
+        let metadata = fs::metadata(&root).unwrap();
+        let effective_root = fs::canonicalize(&root).unwrap();
+        let effective_root = effective_root.to_str().unwrap();
+        let base = format!(
+            "1 0 0:1 / / rw - rootfs rootfs rw\n2 1 0:2 / {effective_root} rw - tmpfs tmpfs rw\n"
+        );
+
+        let run = |error_line: &str, mountinfo: &str| {
+            write_stub(
+                &directory,
+                "find",
+                &format!("printf '%s\\n' \"{error_line}\" >&2\nexit 1"),
+            );
+            let output = run_temp_setid_probe_with_mountinfo(
+                &directory,
+                &root,
+                mountinfo,
+                metadata.uid(),
+                metadata.gid(),
+            );
+            assert!(output.status.success());
+            String::from_utf8(output.stdout).unwrap()
+        };
+
+        // A `Permission denied` on a foreign mount point strictly below the
+        // root is what `-xdev` would have skipped anyway: not partial.
+        let denied_mount = format!("find: '{effective_root}/.mount_app': Permission denied");
+        let foreign =
+            format!("{base}3 2 0:73 / {effective_root}/.mount_app ro,nosuid - fuse.app app ro\n");
+        let stdout = run(&denied_mount, &foreign);
+        assert!(stdout.trim().is_empty(), "{stdout}");
+
+        // Same, with an octal-escaped mount point and an unquoted (BusyBox) message.
+        let denied_spaced = format!("find: {effective_root}/mount dir: Permission denied");
+        let spaced = format!(
+            "{base}3 2 0:74 / {effective_root}/mount\\040dir ro,nosuid - fuse.app app ro\n"
+        );
+        let stdout = run(&denied_spaced, &spaced);
+        assert!(stdout.trim().is_empty(), "{stdout}");
+
+        // The same path when it is not a mount point is a real coverage gap.
+        let stdout = run(&denied_mount, &base);
+        assert!(stdout.contains("PARTIAL:"), "{stdout}");
+
+        // A non-permission failure on a mount point is still a real failure.
+        let stale = format!("find: '{effective_root}/.mount_app': Stale file handle");
+        let stdout = run(&stale, &foreign);
+        assert!(stdout.contains("PARTIAL:"), "{stdout}");
+
+        // The walked root itself failing is never explained by mountinfo.
+        let denied_root = format!("find: '{effective_root}': Permission denied");
+        let stdout = run(&denied_root, &foreign);
+        assert!(stdout.contains("PARTIAL:"), "{stdout}");
+
+        // A mount point that is not below the root does not explain anything.
+        let denied_sibling = format!("find: '{effective_root}-other': Permission denied");
+        let sibling =
+            format!("{base}3 1 0:75 / {effective_root}-other ro,nosuid - fuse.app app ro\n");
+        let stdout = run(&denied_sibling, &sibling);
+        assert!(stdout.contains("PARTIAL:"), "{stdout}");
+
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1299,6 +1453,51 @@ mod tests {
                 || stdout.contains("UNAVAILABLE:")
                 || stdout.contains("PARTIAL:")
         );
+    }
+
+    #[test]
+    fn process_sample_excludes_kernel_threads_and_zombies() {
+        const PF_KTHREAD: u64 = 0x0020_0000;
+
+        fn stat_fields(pid: &str) -> Option<(String, u64)> {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            let rest = stat.rsplit_once(") ")?.1;
+            let mut fields = rest.split_whitespace();
+            let state = fields.next()?.to_string();
+            let flags = fields.nth(5)?.parse().ok()?;
+            Some((state, flags))
+        }
+
+        let directory = stub_dir();
+        let output = run_with_stubs(probe("SHUV-EVID-PROC-001"), &directory);
+        fs::remove_dir_all(directory).unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(output.status.success());
+
+        let sampled = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix("pid="))
+            .map(|rest| rest.split('\t').next().unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            !sampled.is_empty() || stdout.contains("UNAVAILABLE:") || stdout.contains("PARTIAL:")
+        );
+        for pid in &sampled {
+            // A process may legitimately exit between sampling and this check.
+            if let Some((state, flags)) = stat_fields(pid) {
+                assert_ne!(state, "Z", "zombie pid {pid} sampled: {stdout}");
+                assert_eq!(
+                    flags & PF_KTHREAD,
+                    0,
+                    "kernel thread pid {pid} sampled: {stdout}"
+                );
+            }
+        }
+        if let Some((_, flags)) = stat_fields("2") {
+            if flags & PF_KTHREAD != 0 {
+                assert!(!sampled.iter().any(|pid| pid == "2"), "{stdout}");
+            }
+        }
     }
 
     #[test]

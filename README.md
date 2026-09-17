@@ -198,9 +198,20 @@ password authentication separately.
   and process/socket/namespace/cgroup visibility can also be restricted by
   `hidepid` or kernel policy. Those unprivileged results are explicitly marked
   partial and remain collection errors for `--strict-collection`.
-- Process-based observations retain a low/high PID sample. Access controls may
-  filter either half after sampling; `partial` reports skipped records. Socket
-  observations bound TCP and UDP independently.
+- Process-based observations retain a low/high PID sample of live user-space
+  processes. Kernel threads (`PF_KTHREAD`) and zombies are excluded before
+  sampling because they have no executable, command line, or namespaces to
+  retain; a process that exits between sampling and inspection is dropped
+  rather than counted. Access controls may filter either half after sampling;
+  `partial` reports skipped records. Socket observations bound TCP and UDP
+  independently.
+- `SHUV-FS-002` walks each temporary directory with `-xdev` and never enters
+  other filesystems mounted below it. A mount point that refuses `stat` even
+  to root (for example a per-user FUSE mount without `allow_other`) is
+  therefore skipped silently, exactly as an accessible foreign mount would be,
+  and does not mark the walk partial. Any other traversal failure still does.
+- Human output previews at most four evidence lines per finding and reports
+  how many more were retained; use a machine format for the full evidence.
 - Package ownership is retained in each package manager's native text format;
   use `package_manager` when parsing `owner` values across distributions.
 - Each finding has an 8 KiB retained evidence budget. `evidence_truncated`,
