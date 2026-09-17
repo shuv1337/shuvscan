@@ -84,7 +84,7 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
                 if line_count > 4 {
                     writeln!(
                         writer,
-                        "         evidence: ... {} more line(s); use --format json for the full evidence",
+                        "         ({} more evidence line(s); use --format json for the full evidence)",
                         line_count - 4
                     )?;
                 }
@@ -589,19 +589,19 @@ mod tests {
 
     #[test]
     fn human_output_discloses_finding_evidence_lines_beyond_the_preview() {
-        let mut report = report();
-        report.findings[0].evidence.output = "one\ntwo\nthree\nfour\nfive\nsix".into();
+        let mut preview_report = report();
+        preview_report.findings[0].evidence.output = "one\ntwo\nthree\nfour\nfive\nsix".into();
         let mut output = Vec::new();
 
-        human(&[report], &mut output).unwrap();
+        human(&[preview_report], &mut output).unwrap();
 
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("evidence: four\n"));
         assert!(!output.contains("evidence: five"));
         assert!(!output.contains("evidence: six"));
-        assert!(output.contains("evidence: ... 2 more line(s); use --format json"));
+        assert!(output.contains("(2 more evidence line(s); use --format json"));
 
-        let mut exact = self::report();
+        let mut exact = report();
         exact.findings[0].evidence.output = "one\ntwo\nthree\nfour".into();
         let mut output = Vec::new();
         human(&[exact], &mut output).unwrap();

@@ -329,7 +329,12 @@ done
     continue
   fi
   if ! shuvscan_unexplained=$(SHUVSCAN_ROOT="$shuvscan_root" SHUVSCAN_FIND_ERRORS="$shuvscan_find_errors" awk '
+    BEGIN {
+      root = ENVIRON["SHUVSCAN_ROOT"]
+      root_mount_length = -1
+    }
     {
+      device = $3
       mp = $5
       out = ""
       while (match(mp, /\\[0-7][0-7][0-7]/)) {
@@ -340,10 +345,14 @@ done
         out = out sprintf("%c", val)
         mp = substr(mp, RSTART + 4)
       }
-      mounts[out mp] = 1
+      mp = out mp
+      mounts[mp] = device
+      if ((mp == "/" || root == mp || substr(root, 1, length(mp) + 1) == mp "/") && length(mp) >= root_mount_length) {
+        root_mount_length = length(mp)
+        root_device = device
+      }
     }
     END {
-      root = ENVIRON["SHUVSCAN_ROOT"]
       n = split(ENVIRON["SHUVSCAN_FIND_ERRORS"], lines, "\n")
       for (i = 1; i <= n; i++) {
         line = lines[i]
@@ -354,7 +363,7 @@ done
         }
         path = substr(line, 7, length(line) - 25)
         if (substr(path, 1, 1) == "\047" && substr(path, length(path)) == "\047") path = substr(path, 2, length(path) - 2)
-        if (substr(path, 1, length(root) + 1) != root "/" || !(path in mounts)) print line
+        if (substr(path, 1, length(root) + 1) != root "/" || !(path in mounts) || root_device == "" || mounts[path] == root_device) print line
       }
     }' /proc/self/mountinfo) || [ -n "$shuvscan_unexplained" ]; then
     printf '%s could not completely inspect %s\n' "$SHUVSCAN_PARTIAL" "$d"
@@ -1019,13 +1028,19 @@ mod tests {
             String::from_utf8(output.stdout).unwrap()
         };
 
-        // A `Permission denied` on a foreign mount point strictly below the
-        // root is what `-xdev` would have skipped anyway: not partial.
+        // A `Permission denied` on a different-device mount point strictly
+        // below the root is what `-xdev` would have skipped anyway: not partial.
         let denied_mount = format!("find: '{effective_root}/.mount_app': Permission denied");
         let foreign =
             format!("{base}3 2 0:73 / {effective_root}/.mount_app ro,nosuid - fuse.app app ro\n");
         let stdout = run(&denied_mount, &foreign);
         assert!(stdout.trim().is_empty(), "{stdout}");
+
+        // A same-device bind mount is not an `-xdev` boundary, so a failure to
+        // inspect it remains partial.
+        let bind = format!("{base}3 2 0:2 / {effective_root}/.mount_app ro - tmpfs tmpfs ro\n");
+        let stdout = run(&denied_mount, &bind);
+        assert!(stdout.contains("PARTIAL:"), "{stdout}");
 
         // Same, with an octal-escaped mount point and an unquoted (BusyBox) message.
         let denied_spaced = format!("find: {effective_root}/mount dir: Permission denied");
