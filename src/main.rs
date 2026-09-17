@@ -1,8 +1,9 @@
 use std::{
     ffi::OsString,
-    fs,
-    io::{self, Write},
+    fs::{self, File, OpenOptions},
+    io::{self, BufWriter, Write},
     num::{NonZeroU64, NonZeroUsize},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     time::Duration,
@@ -171,10 +172,12 @@ fn main() -> ExitCode {
             probe_pack,
             |report| output::jsonl_report(report, &mut writer),
         );
-        if let Err(error) = flush_writer(&mut writer) {
-            if error.kind() != io::ErrorKind::BrokenPipe {
-                eprintln!("shuvscan: could not write report: {error}");
-                return ExitCode::from(2);
+        if streamed.is_ok() {
+            if let Err(error) = writer.persist() {
+                if error.kind() != io::ErrorKind::BrokenPipe {
+                    eprintln!("shuvscan: could not write report: {error}");
+                    return ExitCode::from(2);
+                }
             }
         }
         return streamed_exit(streamed, cli.strict_collection, cli.fail_on);
@@ -202,7 +205,7 @@ fn main() -> ExitCode {
     }
 
     let result = write_reports(cli.format, &reports, probes, &mut writer);
-    if let Err(error) = result.and_then(|()| flush_writer(&mut writer)) {
+    if let Err(error) = result.and_then(|()| writer.persist()) {
         // A consumer closing the pipe early (`shuvscan | head`) is not a
         // scanner failure; still return the severity-based exit code below.
         if error.kind() != io::ErrorKind::BrokenPipe {
@@ -210,7 +213,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
-    drop(writer);
     if cli.open {
         if let Some(path) = &cli.output {
             open_html_report(path);
@@ -223,13 +225,127 @@ fn main() -> ExitCode {
     report_exit(summary, cli.strict_collection, cli.fail_on)
 }
 
-fn report_writer(path: Option<&Path>, format: Format) -> io::Result<Box<dyn Write>> {
+enum ReportWriter {
+    Stdout(io::Stdout),
+    File(OutputFile),
+    Sink,
+}
+
+impl Write for ReportWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Stdout(writer) => writer.write(buf),
+            Self::File(writer) => writer.write(buf),
+            Self::Sink => Ok(buf.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Stdout(writer) => writer.flush(),
+            Self::File(writer) => writer.flush(),
+            Self::Sink => Ok(()),
+        }
+    }
+}
+
+impl ReportWriter {
+    fn persist(self) -> io::Result<()> {
+        match self {
+            Self::File(file) => file.persist(),
+            Self::Stdout(mut writer) => writer.flush(),
+            Self::Sink => Ok(()),
+        }
+    }
+}
+
+struct OutputFile {
+    inner: BufWriter<File>,
+    tmp_path: PathBuf,
+    dest: PathBuf,
+    persisted: bool,
+}
+
+impl OutputFile {
+    fn create(dest: &Path) -> io::Result<Self> {
+        if dest.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "Is a directory",
+            ));
+        }
+        let file_name = dest.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "output path has no file name")
+        })?;
+        let parent = dest.parent().filter(|path| !path.as_os_str().is_empty());
+        for attempt in 0..16 {
+            let mut tmp_name = file_name.to_os_string();
+            tmp_name.push(format!(".{}.{attempt}.tmp", std::process::id()));
+            let tmp_path = match parent {
+                Some(parent) => parent.join(&tmp_name),
+                None => PathBuf::from(&tmp_name),
+            };
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp_path)
+            {
+                Ok(file) => {
+                    let mut permissions = file.metadata()?.permissions();
+                    permissions.set_mode(0o600);
+                    file.set_permissions(permissions)?;
+                    return Ok(Self {
+                        inner: BufWriter::new(file),
+                        tmp_path,
+                        dest: dest.to_path_buf(),
+                        persisted: false,
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not create a private temporary report file",
+        ))
+    }
+
+    fn persist(mut self) -> io::Result<()> {
+        self.inner.flush()?;
+        self.inner.get_ref().sync_all()?;
+        fs::rename(&self.tmp_path, &self.dest)?;
+        self.persisted = true;
+        Ok(())
+    }
+}
+
+impl Write for OutputFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Drop for OutputFile {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = fs::remove_file(&self.tmp_path);
+        }
+    }
+}
+
+fn report_writer(path: Option<&Path>, format: Format) -> io::Result<ReportWriter> {
     if matches!(format, Format::Tui) {
-        return Ok(Box::new(io::sink()));
+        return Ok(ReportWriter::Sink);
     }
     match path {
-        Some(path) => Ok(Box::new(io::BufWriter::new(fs::File::create(path)?))),
-        None => Ok(Box::new(io::stdout())),
+        Some(path) => Ok(ReportWriter::File(OutputFile::create(path)?)),
+        None => Ok(ReportWriter::Stdout(io::stdout())),
     }
 }
 
@@ -248,10 +364,6 @@ fn write_reports(
         Format::Html => output::html(reports, writer),
         Format::Tui => Ok(()),
     }
-}
-
-fn flush_writer(writer: &mut dyn Write) -> io::Result<()> {
-    writer.flush()
 }
 
 fn open_html_report(path: &Path) {
@@ -319,6 +431,7 @@ fn signature_path(manifest: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn summary(targets_requested: usize, targets_completed: usize) -> engine::ScanSummary {
         engine::ScanSummary {
@@ -365,5 +478,55 @@ mod tests {
             streamed_exit(streamed, false, Severity::Critical),
             ExitCode::from(2)
         );
+    }
+
+    #[test]
+    fn report_file_stays_private_and_replaces_atomically() {
+        let directory = std::env::temp_dir().join(format!(
+            "shuvscan-main-atomic-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let dest = directory.join("report.html");
+        fs::write(&dest, "OLD").unwrap();
+
+        let mut file = OutputFile::create(&dest).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "OLD");
+        file.write_all(b"NEW").unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "OLD");
+        file.persist().unwrap();
+
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "NEW");
+        let mode = fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn report_file_drop_leaves_destination_untouched() {
+        let directory = std::env::temp_dir().join(format!(
+            "shuvscan-main-drop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let dest = directory.join("report.html");
+        fs::write(&dest, "OLD").unwrap();
+
+        let mut file = OutputFile::create(&dest).unwrap();
+        file.write_all(b"NEW").unwrap();
+        let tmp_path = file.tmp_path.clone();
+        drop(file);
+
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "OLD");
+        assert!(!tmp_path.exists());
+        let _ = fs::remove_dir_all(&directory);
     }
 }

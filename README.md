@@ -97,15 +97,16 @@ report schema is required.
 JavaScript, and no external resources. Host-derived strings are sanitized and
 HTML-escaped. Collection errors produce an INCOMPLETE verdict; PASS is reserved
 for complete scans with no findings. `--output PATH` writes any non-TUI format
-to a file and leaves stdout empty. `--open` requires `--format html` and
+to a private file (mode 0600), replacing the destination atomically after a
+successful write, and leaves stdout empty. `--open` requires `--format html` and
 `--output`; it launches the report with `xdg-open` and does not wait. A missing
 `xdg-open` is reported on stderr without changing the scan exit code.
 
 `--format tui` is a keyboard-driven viewer for completed reports. It requires
 an interactive terminal and rejects `--output` and `--unordered`. Keys: `j`/`k`
-or arrows move; Enter, Space, `h`, or `l` expand; Tab, `[`, or `]` change
-targets; `g`/`G` first/last row; PgUp/PgDn page; `?` help; `q`, Esc, or Ctrl-C
-quit.
+or up/down move; Enter or Space expand; Tab, `h`/`l`, left/right, or `[`/`]`
+change targets; `g`/`G` first/last row; PgUp/PgDn page; `?` help; `q`, Esc, or
+Ctrl-C quit. Long rows wrap; chrome that cannot wrap is marked with `…`.
 
 Native report schema version 1 permits additive optional fields. Consumers must
 ignore fields they do not recognize.

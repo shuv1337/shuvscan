@@ -609,6 +609,13 @@ fn write_html_target(writer: &mut impl Write, index: usize, report: &ScanReport)
             escape(finding.title)
         )?;
         writeln!(writer, "<p>{}</p>", escape(finding.description))?;
+        if !finding.evidence.command.is_empty() {
+            writeln!(
+                writer,
+                "<p class=\"meta\">command: {}</p>",
+                escape(finding.evidence.command)
+            )?;
+        }
         if finding.evidence_truncated {
             writeln!(
                 writer,
@@ -635,6 +642,13 @@ fn write_html_target(writer: &mut impl Write, index: usize, report: &ScanReport)
             escape(observation.id),
             escape(observation.title)
         )?;
+        if !observation.evidence.command.is_empty() {
+            writeln!(
+                writer,
+                "<p class=\"meta\">command: {}</p>",
+                escape(observation.evidence.command)
+            )?;
+        }
         if let Some(partial) = &observation.partial {
             writeln!(writer, "<p>partial: {}</p>", escape(partial))?;
         }
@@ -1196,6 +1210,16 @@ mod tests {
         html(&[report()], &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("2024-08-07T03:06:40Z"));
+    }
+
+    #[test]
+    fn html_includes_evidence_commands() {
+        let mut output = Vec::new();
+        html(&[report()], &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("command: awk fixture"));
+        assert!(output.contains("command: proc fixture"));
     }
 
     #[test]

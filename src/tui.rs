@@ -2,6 +2,7 @@ use std::{
     collections::HashSet,
     io::{self, IsTerminal, Read, Write},
     os::fd::AsRawFd,
+    sync::Mutex,
 };
 
 use crate::{model::ScanReport, output::terminal_safe};
@@ -18,6 +19,7 @@ pub struct Viewer<'a> {
     expanded: Vec<HashSet<usize>>,
     help: bool,
     last_body_height: usize,
+    last_width: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +50,7 @@ impl<'a> Viewer<'a> {
             expanded: reports.iter().map(|_| HashSet::new()).collect(),
             help: false,
             last_body_height: 10,
+            last_width: 80,
         }
     }
 
@@ -93,15 +96,15 @@ impl<'a> Viewer<'a> {
                 self.selected = self.row_count().saturating_sub(1);
                 true
             }
-            Key::Enter | Key::Char(' ') | Key::Char('l') | Key::Char('h') => {
+            Key::Enter | Key::Char(' ') => {
                 self.toggle_expanded();
                 true
             }
-            Key::Tab | Key::Right | Key::Char(']') => {
+            Key::Tab | Key::Right | Key::Char(']') | Key::Char('l') => {
                 self.shift_target(1);
                 true
             }
-            Key::BackTab | Key::Left | Key::Char('[') => {
+            Key::BackTab | Key::Left | Key::Char('[') | Key::Char('h') => {
                 self.shift_target(-1);
                 true
             }
@@ -110,24 +113,21 @@ impl<'a> Viewer<'a> {
     }
 
     /// Render `height` lines of `width` columns. The selected row is kept in
-    /// view. Lines are truncated to `width` by Unicode scalar count.
+    /// view. Body lines wrap; header and footer that overflow are marked with `…`.
     pub fn frame(&mut self, width: usize, height: usize) -> Vec<String> {
         let width = width.max(1);
         let height = height.max(1);
+        self.last_width = width;
         let header = self.header_lines();
         let footer = vec![self.footer_line()];
         let chrome = header.len() + footer.len();
         let body_height = height.saturating_sub(chrome);
         self.last_body_height = body_height.max(1);
-        let body = if self.help {
-            help_lines()
-        } else {
-            self.body_lines()
-        };
+        let body = self.wrapped_body(width);
         self.follow_selection(&body, body_height);
         let mut lines = Vec::with_capacity(height);
         for line in &header {
-            lines.push(fit(line, width));
+            lines.push(ellipsize(line, width));
         }
         let start = self.scroll.min(
             body.len()
@@ -136,13 +136,13 @@ impl<'a> Viewer<'a> {
         );
         let end = (start + body_height).min(body.len());
         for line in &body[start..end] {
-            lines.push(fit(line, width));
+            lines.push(line.clone());
         }
         while lines.len() + footer.len() < height {
             lines.push(String::new());
         }
         for line in &footer {
-            lines.push(fit(line, width));
+            lines.push(ellipsize(line, width));
         }
         lines.truncate(height);
         lines
@@ -153,10 +153,19 @@ impl<'a> Viewer<'a> {
             return None;
         }
         let header = self.header_lines().len();
-        let body = self.body_lines();
+        let body = self.wrapped_body(self.last_width.max(1));
         let anchor = self.selected_anchor(&body)?;
         let index = header + anchor.saturating_sub(self.scroll);
         (index < lines.len().saturating_sub(1)).then_some(index)
+    }
+
+    fn wrapped_body(&self, width: usize) -> Vec<String> {
+        let source = if self.help {
+            help_lines()
+        } else {
+            self.body_lines()
+        };
+        wrap_lines(&source, width)
     }
 
     fn header_lines(&self) -> Vec<String> {
@@ -207,7 +216,7 @@ impl<'a> Viewer<'a> {
         if self.help {
             "?/Esc close help   q quit".into()
         } else {
-            "j/k move  enter expand  tab target  ? help  q quit".into()
+            "j/k move  enter expand  h/l target  ? help  q quit".into()
         }
     }
 
@@ -227,6 +236,12 @@ impl<'a> Viewer<'a> {
                 finding.title
             ));
             if expanded.contains(&row) {
+                if !finding.evidence.command.is_empty() {
+                    lines.push(format!(
+                        "    command: {}",
+                        terminal_safe(finding.evidence.command)
+                    ));
+                }
                 if finding.evidence_truncated {
                     lines.push(format!(
                         "    evidence truncated: {} byte(s) omitted ({}-byte limit)",
@@ -236,7 +251,7 @@ impl<'a> Viewer<'a> {
                 for line in finding.evidence.output.lines() {
                     lines.push(format!("    {}", terminal_safe(line)));
                 }
-                lines.push(format!("    fix: {}", finding.remediation));
+                lines.push(format!("    fix: {}", terminal_safe(finding.remediation)));
             }
             row += 1;
         }
@@ -247,6 +262,12 @@ impl<'a> Viewer<'a> {
                 observation.id, observation.title
             ));
             if expanded.contains(&row) {
+                if !observation.evidence.command.is_empty() {
+                    lines.push(format!(
+                        "    command: {}",
+                        terminal_safe(observation.evidence.command)
+                    ));
+                }
                 if let Some(partial) = &observation.partial {
                     lines.push(format!("    partial: {}", terminal_safe(partial)));
                 }
@@ -267,11 +288,18 @@ impl<'a> Viewer<'a> {
         }
         for error in &report.errors {
             let marker = if expanded.contains(&row) { '-' } else { '+' };
-            lines.push(format!(
-                "{marker} ERROR    {}  {}",
-                terminal_safe(error.probe),
-                terminal_safe(&error.message)
-            ));
+            if expanded.contains(&row) {
+                lines.push(format!("{marker} ERROR    {}", terminal_safe(error.probe)));
+                for line in error.message.lines() {
+                    lines.push(format!("    {}", terminal_safe(line)));
+                }
+            } else {
+                lines.push(format!(
+                    "{marker} ERROR    {}  {}",
+                    terminal_safe(error.probe),
+                    terminal_safe(&error.message)
+                ));
+            }
             row += 1;
         }
         if lines.is_empty() {
@@ -296,6 +324,15 @@ impl<'a> Viewer<'a> {
         None
     }
 
+    fn selected_span(&self, body: &[String]) -> Option<(usize, usize)> {
+        let start = self.selected_anchor(body)?;
+        let end = body[start + 1..]
+            .iter()
+            .position(|line| line.starts_with('+') || line.starts_with('-'))
+            .map_or(body.len(), |offset| start + 1 + offset);
+        Some((start, end))
+    }
+
     fn follow_selection(&mut self, body: &[String], body_height: usize) {
         if body_height == 0 || body.is_empty() {
             self.scroll = 0;
@@ -303,13 +340,17 @@ impl<'a> Viewer<'a> {
         }
         let max_scroll = body.len().saturating_sub(body_height);
         self.scroll = self.scroll.min(max_scroll);
-        let Some(anchor) = self.selected_anchor(body) else {
+        let Some((start, end)) = self.selected_span(body) else {
             return;
         };
-        if anchor < self.scroll {
-            self.scroll = anchor;
-        } else if anchor >= self.scroll + body_height {
-            self.scroll = anchor + 1 - body_height;
+        if start < self.scroll {
+            self.scroll = start;
+        }
+        if end > self.scroll + body_height {
+            self.scroll = end.saturating_sub(body_height);
+            if start < self.scroll {
+                self.scroll = start;
+            }
         }
     }
 
@@ -369,30 +410,33 @@ pub fn ensure_interactive() -> io::Result<()> {
 
 pub fn run(reports: &[ScanReport]) -> io::Result<()> {
     ensure_interactive()?;
+    let _guard = TerminalGuard::enter()?;
     let mut stdout = io::stdout();
-    let _raw = RawMode::enter()?;
     let mut viewer = Viewer::new(reports);
-    write!(stdout, "\x1b[?1049h\x1b[?25l")?;
-    stdout.flush()?;
-    let result = event_loop(&mut viewer, &mut stdout);
-    let _ = write!(stdout, "\x1b[?25h\x1b[?1049l");
-    let _ = stdout.flush();
-    result
+    event_loop(&mut viewer, &mut stdout)
 }
 
 fn event_loop(viewer: &mut Viewer<'_>, stdout: &mut io::Stdout) -> io::Result<()> {
     let mut stdin = io::stdin();
+    let mut last_size = (0, 0);
+    let mut dirty = true;
     loop {
-        let (width, height) = window_size();
-        let lines = viewer.frame(width, height);
-        let selected = viewer.selected_line(&lines);
-        draw(stdout, &lines, selected)?;
+        let size = window_size();
+        if dirty || size != last_size {
+            last_size = size;
+            let (width, height) = size;
+            let lines = viewer.frame(width, height);
+            let selected = viewer.selected_line(&lines);
+            draw(stdout, &lines, selected)?;
+            dirty = false;
+        }
         match read_key(&mut stdin)? {
             None => continue,
             Some(key) => {
                 if !viewer.handle(key) {
                     return Ok(());
                 }
+                dirty = true;
             }
         }
     }
@@ -417,9 +461,10 @@ fn help_lines() -> Vec<String> {
     vec![
         "Keyboard".into(),
         "  j/k, Down/Up     next/previous row".into(),
+        "  h/l, Left/Right  previous/next target".into(),
         "  Tab/Shift-Tab    next/previous target".into(),
-        "  [/], Left/Right  previous/next target".into(),
-        "  Enter/Space/h/l  expand or collapse the selected row".into(),
+        "  [/]              previous/next target".into(),
+        "  Enter/Space      expand or collapse the selected row".into(),
         "  g/G, Home/End    first/last row".into(),
         "  PgUp/PgDn        page through rows".into(),
         "  ?                toggle this help".into(),
@@ -429,8 +474,61 @@ fn help_lines() -> Vec<String> {
     ]
 }
 
-fn fit(line: &str, width: usize) -> String {
-    line.chars().take(width).collect()
+fn wrap_lines(lines: &[String], width: usize) -> Vec<String> {
+    lines
+        .iter()
+        .flat_map(|line| wrap_line(line, width))
+        .collect()
+}
+
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    if line.chars().count() <= width {
+        return vec![line.to_string()];
+    }
+    let indent = if width > 4 { 4 } else { 0 };
+    let mut lines = Vec::new();
+    let mut first = true;
+    let mut chars = line.chars();
+    loop {
+        let columns = if first {
+            width
+        } else {
+            width.saturating_sub(indent).max(1)
+        };
+        let chunk: String = chars.by_ref().take(columns).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        if first {
+            lines.push(chunk);
+            first = false;
+        } else {
+            let mut rendered = String::with_capacity(indent + chunk.len());
+            for _ in 0..indent {
+                rendered.push(' ');
+            }
+            rendered.push_str(&chunk);
+            lines.push(rendered);
+        }
+    }
+    lines
+}
+
+fn ellipsize(line: &str, width: usize) -> String {
+    let width = width.max(1);
+    if line.chars().count() <= width {
+        return line.to_string();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+    let mut truncated: String = line.chars().take(width - 1).collect();
+    truncated.push('…');
+    truncated
 }
 
 fn window_size() -> (usize, usize) {
@@ -457,39 +555,89 @@ fn window_size() -> (usize, usize) {
     (width, height)
 }
 
-struct RawMode {
-    fd: i32,
+struct SavedTty {
+    term_fd: i32,
+    out_fd: i32,
     original: libc::termios,
 }
 
-impl RawMode {
+static SAVED_TTY: Mutex<Option<SavedTty>> = Mutex::new(None);
+
+struct TerminalGuard {
+    term_fd: i32,
+    out_fd: i32,
+    original: libc::termios,
+}
+
+impl TerminalGuard {
     fn enter() -> io::Result<Self> {
-        let fd = io::stdin().as_raw_fd();
+        let term_fd = io::stdin().as_raw_fd();
+        let out_fd = io::stdout().as_raw_fd();
         // SAFETY: `termios` is a C struct with no invalid bit patterns; `tcgetattr`
         // immediately overwrites it for the stdin fd before any field is read.
         let mut original = unsafe { std::mem::zeroed() };
-        // SAFETY: `fd` is stdin; `termios` is written only through the libc API.
-        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+        // SAFETY: `term_fd` is stdin; `termios` is written only through the libc API.
+        if unsafe { libc::tcgetattr(term_fd, &mut original) } != 0 {
             return Err(io::Error::last_os_error());
         }
         let mut raw = original;
         // SAFETY: `raw` is a fully initialized `termios` copied from `tcgetattr`.
         unsafe { libc::cfmakeraw(&mut raw) };
-        // SAFETY: `fd` is still stdin and `raw` is the cfmakeraw-adjusted termios.
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        // SAFETY: `term_fd` is still stdin and `raw` is the cfmakeraw-adjusted termios.
+        if unsafe { libc::tcsetattr(term_fd, libc::TCSANOW, &raw) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd, original })
+        let guard = Self {
+            term_fd,
+            out_fd,
+            original,
+        };
+        let seq = b"\x1b[?1049h\x1b[?25l";
+        // SAFETY: `out_fd` is stdout, already required to be a tty.
+        if unsafe { libc::write(out_fd, seq.as_ptr().cast(), seq.len()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        *SAVED_TTY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SavedTty {
+            term_fd,
+            out_fd,
+            original,
+        });
+        crate::transport::set_interrupt_cleanup(Some(restore_after_interrupt));
+        Ok(guard)
     }
 }
 
-impl Drop for RawMode {
+impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        // SAFETY: `fd` is the stdin we configured; `original` is the termios
-        // captured before raw mode. Best-effort restore on all drop paths.
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
-        }
+        crate::transport::set_interrupt_cleanup(None);
+        restore_tty(self.term_fd, self.out_fd, &self.original);
+        *SAVED_TTY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+fn restore_after_interrupt() {
+    let saved = SAVED_TTY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(saved) = saved {
+        restore_tty(saved.term_fd, saved.out_fd, &saved.original);
+    }
+}
+
+fn restore_tty(term_fd: i32, out_fd: i32, original: &libc::termios) {
+    let seq = b"\x1b[?25h\x1b[?1049l";
+    // SAFETY: best-effort restore of the tty we put in raw/alternate-screen
+    // mode. `libc::write` is used so a locked `Stdout` cannot deadlock the
+    // interrupt thread. Errors are ignored because this runs on Drop and
+    // fatal-signal paths.
+    unsafe {
+        libc::write(out_fd, seq.as_ptr().cast(), seq.len());
+        libc::tcsetattr(term_fd, libc::TCSANOW, original);
     }
 }
 
@@ -778,23 +926,96 @@ mod tests {
         assert!(!joined.contains('\u{1b}'));
         assert!(joined.contains(r"\u{1b}[31mred"));
     }
+
     #[test]
-    fn bracket_keys_cycle_targets_and_hl_toggle_evidence() {
+    fn hl_and_arrows_cycle_targets() {
         let reports = reports();
         let mut viewer = Viewer::new(&reports);
-        viewer.handle(Key::Char(']'));
-        assert_eq!(viewer.target, 1);
-        viewer.handle(Key::Char(']'));
-        assert_eq!(viewer.target, 0);
-        viewer.handle(Key::Char('['));
-        assert_eq!(viewer.target, 1);
-
-        let mut viewer = Viewer::new(&reports);
         viewer.handle(Key::Char('l'));
-        let expanded = viewer.frame(80, 24);
-        assert!(expanded.iter().any(|line| line.contains("account-0")));
+        assert_eq!(viewer.target, 1);
         viewer.handle(Key::Char('h'));
-        let collapsed = viewer.frame(80, 24);
-        assert!(collapsed.iter().all(|line| !line.contains("account-0")));
+        assert_eq!(viewer.target, 0);
+        viewer.handle(Key::Right);
+        assert_eq!(viewer.target, 1);
+        viewer.handle(Key::Left);
+        assert_eq!(viewer.target, 0);
+        viewer.handle(Key::Char(']'));
+        assert_eq!(viewer.target, 1);
+        viewer.handle(Key::Char('['));
+        assert_eq!(viewer.target, 0);
+    }
+
+    #[test]
+    fn long_lines_wrap_instead_of_silent_truncation() {
+        let mut reports = reports();
+        reports[0].findings[0].title =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut viewer = Viewer::new(&reports);
+        let lines = viewer.frame(28, 16);
+        assert_eq!(lines.len(), 16);
+        assert!(lines.iter().all(|line| line.chars().count() <= 28));
+        let compact: String = lines
+            .concat()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(compact.contains("ABCDEFGHIJKLMNOPQRSTUVWXYZ"));
+        assert!(compact.contains("0123456789abcdefghijklmnopqrstuvwxyz"));
+    }
+
+    #[test]
+    fn chrome_marks_horizontal_truncation() {
+        let mut reports = reports();
+        reports[0].target = "T".repeat(80);
+        let mut viewer = Viewer::new(&reports);
+        let lines = viewer.frame(24, 12);
+        assert!(lines[0].chars().count() <= 24);
+        assert!(lines[0].ends_with('…'));
+    }
+
+    #[test]
+    fn error_rows_expand_to_the_full_message() {
+        let mut reports = reports();
+        reports[0].errors[0].message =
+            "could not completely inspect /tmp; could not completely inspect /run/user".into();
+        let mut viewer = Viewer::new(&reports);
+        viewer.handle(Key::End);
+        viewer.handle(Key::Enter);
+        let lines = viewer.frame(36, 16);
+        let compact: String = lines
+            .concat()
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(compact.contains("couldnotcompletelyinspect/tmp"));
+        assert!(compact.contains("couldnotcompletelyinspect/run"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("ERROR") && line.contains("SHUV-AUTH-002"))
+        );
+        assert!(lines.iter().all(|line| line.chars().count() <= 36));
+    }
+
+    #[test]
+    fn expanding_the_last_row_keeps_its_body_visible() {
+        let mut reports = reports();
+        reports[0].errors[0].message = "full collection error text for the last row".into();
+        let mut viewer = Viewer::new(&reports);
+        viewer.handle(Key::End);
+        viewer.handle(Key::Enter);
+        let lines = viewer.frame(48, 8);
+        let joined = lines.join("\n");
+        assert!(joined.contains("ERROR"));
+        assert!(joined.contains("full collection error text"));
+    }
+
+    #[test]
+    fn wrap_line_never_exceeds_width() {
+        let wrapped = wrap_line("abcdefghijklmnopqrstuvwxyz0123456789", 10);
+        assert!(wrapped.iter().all(|line| line.chars().count() <= 10));
+        assert!(wrapped.len() > 1);
+        assert_eq!(wrapped[0], "abcdefghij");
+        assert!(wrapped[1].starts_with("    "));
     }
 }

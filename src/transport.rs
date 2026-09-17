@@ -18,6 +18,25 @@ pub const STDOUT_LIMIT: usize = 512 * 1024;
 const STDERR_LIMIT: usize = 4 * 1024;
 
 static ACTIVE_GROUPS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static INTERRUPT_CLEANUP: Mutex<Option<fn()>> = Mutex::new(None);
+
+/// Run `cleanup` on the interrupt watcher thread before it re-raises SIGINT or
+/// SIGTERM. Used by the TUI to restore the terminal when Drop cannot run.
+pub fn set_interrupt_cleanup(cleanup: Option<fn()>) {
+    *INTERRUPT_CLEANUP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = cleanup;
+}
+
+fn run_interrupt_cleanup() {
+    let cleanup = INTERRUPT_CLEANUP
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(cleanup) = cleanup {
+        cleanup();
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -311,6 +330,7 @@ pub fn forward_interrupts_to_collectors() {
                 return;
             }
             terminate_active_groups();
+            run_interrupt_cleanup();
             libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut());
             libc::raise(signal);
         });

@@ -472,6 +472,8 @@ fn html_report_writes_to_output_and_keeps_stdout_empty() {
     assert!(html.contains("Content-Security-Policy"));
     assert!(html.contains("INCOMPLETE"));
     assert!(!html.contains("class=\"verdict pass\""));
+    let mode = fs::metadata(&report.path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
 }
 
 #[test]
