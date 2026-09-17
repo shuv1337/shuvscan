@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shuvscan.dev/schemas/report-v1.json",
+  "title": "Shuvscan native JSON report",
+  "type": "array",
+  "items": { "$ref": "#/$defs/report" },
+  "$defs": {
+    "severity": {
+      "enum": ["info", "low", "medium", "high", "critical"]
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["command", "output"],
+      "properties": {
+        "command": { "type": "string" },
+        "output": { "type": "string" }
+      }
+    },
+    "pack": {
+      "type": "object",
+      "required": ["schema_version", "id", "version", "signer"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "id": { "type": "string" },
+        "version": { "type": "string" },
+        "signer": { "type": "string" }
+      }
+    },
+    "host": {
+      "type": "object",
+      "required": ["hostname", "kernel", "os", "capabilities"],
+      "properties": {
+        "hostname": { "type": "string" },
+        "kernel": { "type": "string" },
+        "os": { "type": "string" },
+        "capabilities": {
+          "type": "object",
+          "required": ["root", "sudo_present", "tools"],
+          "properties": {
+            "root": { "type": ["boolean", "null"] },
+            "sudo_present": { "type": "boolean" },
+            "tools": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": ["id", "title", "severity", "category", "description", "remediation", "evidence"],
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "severity": { "$ref": "#/$defs/severity" },
+        "category": { "type": "string" },
+        "description": { "type": "string" },
+        "remediation": { "type": "string" },
+        "evidence_truncated": { "type": "boolean" },
+        "evidence_omitted_bytes": { "type": "integer", "minimum": 0 },
+        "evidence_limit_bytes": { "type": "integer", "minimum": 0 },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      }
+    },
+    "observation": {
+      "type": "object",
+      "required": ["id", "title", "category", "partial", "truncated", "evidence_budget_exceeded", "evidence"],
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "category": { "type": "string" },
+        "partial": { "type": ["string", "null"] },
+        "truncated": { "type": "boolean" },
+        "collection_limits": { "type": "array", "items": { "type": "string" } },
+        "evidence_budget_exceeded": { "type": "boolean" },
+        "evidence": { "$ref": "#/$defs/evidence" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["probe", "message"],
+      "properties": {
+        "probe": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    },
+    "report": {
+      "type": "object",
+      "required": ["schema_version", "scanner_version", "scan_id", "started_at", "completed_at", "target", "host", "duration_ms", "probes_run", "findings", "errors"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "scanner_version": { "type": "string" },
+        "scan_id": { "type": "string", "minLength": 1 },
+        "started_at": { "type": "integer", "minimum": 0 },
+        "completed_at": { "type": "integer", "minimum": 0 },
+        "probe_pack": { "$ref": "#/$defs/pack" },
+        "target": { "type": "string" },
+        "host": { "anyOf": [{ "$ref": "#/$defs/host" }, { "type": "null" }] },
+        "duration_ms": { "type": "integer", "minimum": 0 },
+        "probes_run": { "type": "integer", "minimum": 0 },
+        "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+        "observations": { "type": "array", "items": { "$ref": "#/$defs/observation" } },
+        "errors": { "type": "array", "items": { "$ref": "#/$defs/error" } }
+      }
+    }
+  }
+}

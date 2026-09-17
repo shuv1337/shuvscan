@@ -6,14 +6,7 @@
 //! an attacker on the target (for example a crafted file name printed by
 //! `find`) cannot forge or terminate a section.
 
-use std::{
-    collections::HashMap,
-    fmt::Write as _,
-    fs,
-    hash::{DefaultHasher, Hash, Hasher},
-    io::Read,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashMap, fmt::Write as _, fs, io, io::Read};
 
 use crate::{
     model::{HostCapabilities, HostInfo},
@@ -21,11 +14,12 @@ use crate::{
 };
 
 const META_ID: &str = "meta";
+pub(crate) const OS_RELEASE_ID: &str = "os-release";
+const OS_RELEASE_LIMIT: usize = 16 * 1024;
 pub(crate) const CAPABILITIES_ID: &str = "capabilities";
 
 const META_BODY: &str = r#"printf 'hostname=%s\n' "$(uname -n 2>/dev/null)"
 printf 'kernel=%s\n' "$(uname -r 2>/dev/null)"
-printf 'os=%s\n' "$( ( . /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-}" ) )"
 printf 'root=%s\n' "$SHUVSCAN_IS_ROOT"
 if command -v sudo >/dev/null 2>&1; then printf 'sudo_present=1\n'; else printf 'sudo_present=0\n'; fi"#;
 
@@ -44,27 +38,52 @@ pub struct Transcript {
     pub sections: HashMap<String, Section>,
 }
 
-/// Random marker nonce. Prefers the kernel CSPRNG; the time/pid fallback only
-/// exists for exotic build targets and still avoids trivially guessable values.
-pub fn nonce() -> String {
-    let mut bytes = [0u8; 8];
-    if fs::File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .is_ok()
-    {
-        return bytes.iter().fold(String::new(), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        });
+/// Random marker nonce. Protocol framing is a security boundary, so collection
+/// fails rather than falling back to predictable entropy.
+pub fn nonce() -> io::Result<String> {
+    random_hex(8)
+}
+
+pub(crate) fn random_hex(byte_count: usize) -> io::Result<String> {
+    let mut bytes = vec![0u8; byte_count];
+    fill_random(&mut bytes)?;
+    Ok(bytes.iter().fold(String::new(), |mut hex, byte| {
+        let _ = write!(hex, "{byte:02x}");
+        hex
+    }))
+}
+
+fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
+    let mut filled = 0;
+    while filled < bytes.len() {
+        // SAFETY: the pointer and length describe the writable remainder of
+        // `bytes`; flags zero requests blocking kernel-provided randomness.
+        let read = unsafe {
+            libc::getrandom(bytes[filled..].as_mut_ptr().cast(), bytes.len() - filled, 0)
+        };
+        if read > 0 {
+            filled += usize::try_from(read)
+                .map_err(|_| io::Error::other("getrandom returned an invalid length"))?;
+            continue;
+        }
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "getrandom returned no bytes",
+            ));
+        }
+
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if matches!(error.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) {
+            fs::File::open("/dev/urandom")?.read_exact(&mut bytes[filled..])?;
+            return Ok(());
+        }
+        return Err(error);
     }
-    let mut hasher = DefaultHasher::new();
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    Ok(())
 }
 
 pub fn build_script(probes: &[Probe], nonce: &str) -> String {
@@ -76,6 +95,11 @@ pub fn build_script(probes: &[Probe], nonce: &str) -> String {
         "SHUVSCAN_UNAVAILABLE='__SHUVSCAN__{nonce}__UNAVAILABLE__'\nSHUVSCAN_PARTIAL='__SHUVSCAN__{nonce}__PARTIAL__'\nSHUVSCAN_TRUNCATED='__SHUVSCAN__{nonce}__TRUNCATED__'"
     );
     push_section(&mut script, nonce, META_ID, META_BODY);
+    let os_release_body = format!(
+        "if [ -e /etc/os-release ] || [ -L /etc/os-release ]; then\n  if [ ! -r /etc/os-release ]; then\n    printf '%s os-release is not readable\\n' \"$SHUVSCAN_UNAVAILABLE\"\n  elif command -v od >/dev/null 2>&1; then\n    od -A n -t x1 -v -N {} /etc/os-release 2>/dev/null || printf '%s os-release read failed\\n' \"$SHUVSCAN_UNAVAILABLE\"\n  else\n    printf '%s od is required to read os-release safely\\n' \"$SHUVSCAN_UNAVAILABLE\"\n  fi\nfi",
+        OS_RELEASE_LIMIT + 1
+    );
+    push_section(&mut script, nonce, OS_RELEASE_ID, &os_release_body);
     let mut tools = probes
         .iter()
         .flat_map(|probe| probe.required_tools.iter().copied())
@@ -180,6 +204,18 @@ pub fn parse(raw: &str, nonce: &str) -> Transcript {
         }
     }
 
+    let os = sections.get_mut(OS_RELEASE_ID).and_then(|section| {
+        if section.status != 0 || section.unavailable.is_some() {
+            return None;
+        }
+        match parse_os_release_hex(&section.output) {
+            Ok(os) => os,
+            Err(error) => {
+                section.unavailable = Some(error);
+                None
+            }
+        }
+    });
     let host = sections.get(META_ID).map(|section| {
         let tools = sections
             .get(CAPABILITIES_ID)
@@ -188,16 +224,16 @@ pub fn parse(raw: &str, nonce: &str) -> Transcript {
             .flat_map(|section| section.output.lines())
             .filter_map(|line| line.strip_prefix("tool=").map(str::to_owned))
             .collect();
-        parse_meta(&section.output, tools)
+        parse_meta(&section.output, tools, os)
     });
     Transcript { host, sections }
 }
 
-fn parse_meta(output: &str, tools: Vec<String>) -> HostInfo {
+fn parse_meta(output: &str, tools: Vec<String>, os: Option<String>) -> HostInfo {
     let mut host = HostInfo {
         hostname: "unknown".into(),
         kernel: "unknown".into(),
-        os: "unknown".into(),
+        os: os.unwrap_or_else(|| "unknown".into()),
         capabilities: HostCapabilities {
             root: None,
             sudo_present: false,
@@ -213,7 +249,6 @@ fn parse_meta(output: &str, tools: Vec<String>) -> HostInfo {
             match key {
                 "hostname" => host.hostname = value.to_owned(),
                 "kernel" => host.kernel = value.to_owned(),
-                "os" => host.os = value.to_owned(),
                 "root" => {
                     host.capabilities.root = match value {
                         "1" => Some(true),
@@ -227,6 +262,100 @@ fn parse_meta(output: &str, tools: Vec<String>) -> HostInfo {
         }
     }
     host
+}
+
+fn parse_os_release_hex(encoded: &str) -> Result<Option<String>, String> {
+    let mut bytes = Vec::new();
+    let mut high = None;
+    for byte in encoded.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        let nibble = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return Err("os-release collector returned invalid hex".into()),
+        };
+        if let Some(high) = high.take() {
+            bytes.push((high << 4) | nibble);
+            if bytes.len() > OS_RELEASE_LIMIT {
+                return Err(format!(
+                    "os-release exceeded the {OS_RELEASE_LIMIT}-byte collection limit"
+                ));
+            }
+        } else {
+            high = Some(nibble);
+        }
+    }
+    if high.is_some() {
+        return Err("os-release collector returned incomplete hex".into());
+    }
+    let contents =
+        std::str::from_utf8(&bytes).map_err(|_| "os-release is not valid UTF-8".to_owned())?;
+    Ok(parse_os_release(contents))
+}
+
+fn parse_os_release(contents: &str) -> Option<String> {
+    let mut pretty_name = None;
+    for line in contents.lines() {
+        if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
+            // Later duplicate keys win, matching shell assignment behavior.
+            pretty_name = parse_os_release_value(value);
+        }
+    }
+    pretty_name
+}
+
+fn parse_os_release_value(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        let mut parsed = String::new();
+        let mut chars = inner.chars();
+        while let Some(character) = chars.next() {
+            match character {
+                '"' => return None,
+                '\\' => {
+                    let escaped = chars.next()?;
+                    if !matches!(escaped, '$' | '`' | '"' | '\\') {
+                        parsed.push('\\');
+                    }
+                    parsed.push(escaped);
+                }
+                _ => parsed.push(character),
+            }
+        }
+        return (!parsed.is_empty()).then_some(parsed);
+    }
+    if let Some(inner) = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return (!inner.is_empty() && !inner.contains('\'')).then(|| inner.to_owned());
+    }
+    if value.starts_with(['"', '\'']) || value.ends_with(['"', '\'']) {
+        return None;
+    }
+
+    let mut parsed = String::new();
+    let mut chars = value.chars();
+    while let Some(character) = chars.next() {
+        if character == '\\' {
+            parsed.push(chars.next()?);
+        } else if character.is_whitespace()
+            || matches!(
+                character,
+                '"' | '\'' | '$' | '`' | ';' | '&' | '|' | '(' | ')' | '<' | '>'
+            )
+        {
+            return None;
+        } else {
+            parsed.push(character);
+        }
+    }
+    (!parsed.is_empty()).then_some(parsed)
 }
 
 fn parse_section_output(
@@ -280,14 +409,27 @@ mod tests {
         )
     }
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     #[test]
     fn parses_sections_and_host_metadata() {
         let raw = format!(
-            "{}{}{}",
+            "{}{}{}{}",
             wrap(
                 "meta",
                 0,
-                "hostname=web-01\nkernel=6.8.0\nos=Ubuntu 24.04 LTS\nroot=1\nsudo_present=1"
+                "hostname=web-01\nkernel=6.8.0\nroot=1\nsudo_present=1"
+            ),
+            wrap(
+                OS_RELEASE_ID,
+                0,
+                &hex(b"PRETTY_NAME=\"Ubuntu 24.04 LTS\"\n")
             ),
             wrap("capabilities", 0, "tool=awk\ntool=find"),
             wrap("SHUV-X", 0, "evidence line")
@@ -327,11 +469,156 @@ mod tests {
     fn script_wraps_every_probe_and_meta() {
         let script = build_script(BUILTINS, NONCE);
         assert!(script.contains("__BEGIN__meta__"));
+        assert!(script.contains("__BEGIN__os-release__"));
         assert!(script.contains("__BEGIN__capabilities__"));
+        assert!(script.contains("od -A n -t x1 -v -N 16385 /etc/os-release"));
+        assert!(script.contains("[ ! -r /etc/os-release ]"));
+        assert!(script.contains("os-release is not readable"));
+        assert!(!script.contains(". /etc/os-release"));
+        assert!(!script.contains("eval "));
         for probe in BUILTINS {
             assert!(script.contains(&format!("__BEGIN__{}__", probe.id)));
             assert!(script.contains(&format!("__END__{}__", probe.id)));
         }
+    }
+
+    #[test]
+    fn random_values_use_kernel_entropy() {
+        let first = nonce().unwrap();
+        let second = nonce().unwrap();
+
+        assert_eq!(first.len(), 16);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+        assert_eq!(random_hex(16).unwrap().len(), 32);
+    }
+
+    #[test]
+    fn parses_documented_os_release_values_as_data() {
+        assert_eq!(
+            parse_os_release(r#"PRETTY_NAME="Shuv \"Secure\" \\ Linux""#).as_deref(),
+            Some("Shuv \"Secure\" \\ Linux")
+        );
+        assert_eq!(
+            parse_os_release("PRETTY_NAME='Single quoted Linux'").as_deref(),
+            Some("Single quoted Linux")
+        );
+        assert_eq!(
+            parse_os_release(r"PRETTY_NAME=Escaped\ Linux").as_deref(),
+            Some("Escaped Linux")
+        );
+        assert_eq!(
+            parse_os_release("PRETTY_NAME=First\nPRETTY_NAME=Later").as_deref(),
+            Some("Later")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_malformed_or_oversized_os_release_data() {
+        assert!(parse_os_release("NAME=Linux").is_none());
+        assert!(parse_os_release("PRETTY_NAME=\"unterminated").is_none());
+        assert!(parse_os_release("PRETTY_NAME=\"joined\"\"value\"").is_none());
+        assert!(parse_os_release_hex("f").is_err());
+        assert!(parse_os_release_hex("ff").is_err());
+        assert!(parse_os_release_hex(&"41".repeat(OS_RELEASE_LIMIT + 1)).is_err());
+    }
+
+    #[test]
+    fn os_release_cannot_override_trusted_metadata_fields() {
+        let release = b"PRETTY_NAME=\"Fixture Linux\"\nroot=1\nsudo_present=1\n";
+        let raw = format!(
+            "{}{}",
+            wrap("meta", 0, "hostname=host\nroot=0\nsudo_present=0"),
+            wrap(OS_RELEASE_ID, 0, &hex(release))
+        );
+        let host = parse(&raw, NONCE).host.unwrap();
+
+        assert_eq!(host.os, "Fixture Linux");
+        assert_eq!(host.capabilities.root, Some(false));
+        assert!(!host.capabilities.sudo_present);
+    }
+
+    #[test]
+    fn failed_os_release_collection_leaves_os_unknown() {
+        let raw = format!(
+            "{}{}",
+            wrap("meta", 0, "hostname=host"),
+            wrap(OS_RELEASE_ID, 1, &hex(b"PRETTY_NAME=\"Untrusted Linux\"\n"))
+        );
+
+        assert_eq!(parse(&raw, NONCE).host.unwrap().os, "unknown");
+    }
+
+    #[test]
+    fn invalid_os_release_collection_is_marked_unavailable() {
+        let raw = format!(
+            "{}{}",
+            wrap("meta", 0, "hostname=host"),
+            wrap(OS_RELEASE_ID, 0, "not-hex")
+        );
+        let transcript = parse(&raw, NONCE);
+
+        assert_eq!(transcript.host.unwrap().os, "unknown");
+        assert_eq!(
+            transcript.sections[OS_RELEASE_ID].unavailable.as_deref(),
+            Some("os-release collector returned invalid hex")
+        );
+    }
+
+    #[test]
+    fn collector_does_not_execute_os_release_shell_syntax() {
+        let suffix = nonce().unwrap();
+        let fixture = std::env::temp_dir().join(format!("shuvscan-os-release-{suffix}"));
+        let marker = std::env::temp_dir().join(format!("shuvscan-os-release-marker-{suffix}"));
+        let alternate_marker =
+            std::env::temp_dir().join(format!("shuvscan-os-release-alternate-{suffix}"));
+        std::fs::write(
+            &fixture,
+            b"PRETTY_NAME=\"$(printf exploited >$SHUVSCAN_TEST_MARKER)\"\nID=`printf alternate >$SHUVSCAN_TEST_ALTERNATE_MARKER`\n",
+        )
+        .unwrap();
+        let escaped_fixture = fixture.to_string_lossy().replace('\'', "'\\''");
+        let probes = [Probe {
+            id: "SHUV-TEST-001",
+            title: "test",
+            category: "test",
+            description: "test",
+            required_tools: &["printf"],
+            privilege: Privilege::Unprivileged,
+            script: ":",
+            kind: crate::probes::ProbeKind::Evidence,
+        }];
+        let script = build_script(&probes, NONCE)
+            .replace("/etc/os-release", &format!("'{escaped_fixture}'"));
+        let mut child = std::process::Command::new("sh")
+            .arg("-s")
+            .env("SHUVSCAN_TEST_MARKER", &marker)
+            .env("SHUVSCAN_TEST_ALTERNATE_MARKER", &alternate_marker)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(child.stdin.as_mut().unwrap(), script.as_bytes()).unwrap();
+        let output = child.wait_with_output().unwrap();
+        let marker_exists = marker.exists();
+        let alternate_marker_exists = alternate_marker.exists();
+        let _ = std::fs::remove_file(&fixture);
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&alternate_marker);
+
+        assert!(
+            output.status.success(),
+            "collector failed: {}\n{script}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!marker_exists);
+        assert!(!alternate_marker_exists);
+        let transcript = parse(&String::from_utf8(output.stdout).unwrap(), NONCE);
+        assert_eq!(
+            transcript.host.unwrap().os,
+            "$(printf exploited >$SHUVSCAN_TEST_MARKER)"
+        );
     }
 
     #[test]

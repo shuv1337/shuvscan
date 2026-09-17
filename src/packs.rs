@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeSet,
-    fs::File,
+    fs::{self, OpenOptions},
     io::{self, Read},
+    os::unix::fs::OpenOptionsExt,
     path::Path,
 };
 
@@ -192,10 +193,24 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
 }
 
 fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let read_limit = u64::try_from(limit)
-        .map_err(|_| io::Error::other("file size limit does not fit u64"))?
-        .saturating_add(1);
+    require_regular_file(&fs::metadata(path)?)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    require_regular_file(&metadata)?;
+
+    let limit_u64 =
+        u64::try_from(limit).map_err(|_| io::Error::other("file size limit does not fit u64"))?;
+    if metadata.len() > limit_u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            format!("file exceeds the {limit}-byte limit"),
+        ));
+    }
+
+    let read_limit = limit_u64.saturating_add(1);
     let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
     file.take(read_limit).read_to_end(&mut bytes)?;
     if bytes.len() > limit {
@@ -205,6 +220,17 @@ fn read_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+fn require_regular_file(metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.file_type().is_file() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "probe pack input must be a regular file",
+        ))
+    }
 }
 
 fn read_hex_text(
@@ -225,9 +251,42 @@ fn read_hex_text(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        ffi::CString,
+        fs,
+        os::unix::{ffi::OsStrExt, fs::symlink},
+        path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{Duration, Instant},
+    };
+
     use ed25519_dalek::{Signer, SigningKey};
 
     use super::*;
+
+    static TEMP_ID: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempDirectory(PathBuf);
+
+    impl TempDirectory {
+        fn create() -> Self {
+            let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("shuvscan-pack-test-{}-{id}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn signed(source: &[u8]) -> (String, String) {
         let key = SigningKey::from_bytes(&[7; 32]);
@@ -240,6 +299,71 @@ mod tests {
 
     fn encode_hex(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    #[test]
+    fn regular_pack_files_load_and_preserve_exact_signature_bytes() {
+        let directory = TempDirectory::create();
+        let manifest_path = directory.path().join("pack.json");
+        let signature_path = directory.path().join("pack.json.sig");
+        let key_path = directory.path().join("trusted-key.hex");
+        let source = br#"{"schema_version":1,"id":"test","version":"1","signer":"test","probes":["SHUV-AUTH-001"]}"#;
+        let (signature, key) = signed(source);
+        fs::write(&manifest_path, source).unwrap();
+        fs::write(&signature_path, signature).unwrap();
+        fs::write(&key_path, key).unwrap();
+
+        let pack = load(&manifest_path, &signature_path, &key_path).unwrap();
+
+        assert_eq!(pack.info.id, "test");
+        assert_eq!(pack.probes[0].id, "SHUV-AUTH-001");
+    }
+
+    #[test]
+    fn bounded_reader_rejects_non_regular_files_without_blocking() {
+        let directory = TempDirectory::create();
+        let fifo_path = directory.path().join("pack.fifo");
+        let fifo_path_bytes = CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the path is a NUL-terminated CString and the mode is valid.
+        assert_eq!(unsafe { libc::mkfifo(fifo_path_bytes.as_ptr(), 0o600) }, 0);
+
+        let started = Instant::now();
+        let fifo_error = read_bounded(&fifo_path, MAX_PACK_BYTES).unwrap_err();
+        assert_eq!(fifo_error.kind(), io::ErrorKind::InvalidInput);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let fifo_symlink_path = directory.path().join("pack-fifo-link");
+        symlink(&fifo_path, &fifo_symlink_path).unwrap();
+        let fifo_symlink_error = read_bounded(&fifo_symlink_path, MAX_PACK_BYTES).unwrap_err();
+        assert_eq!(fifo_symlink_error.kind(), io::ErrorKind::InvalidInput);
+
+        let device_error = read_bounded(Path::new("/dev/null"), MAX_PACK_BYTES).unwrap_err();
+        assert_eq!(device_error.kind(), io::ErrorKind::InvalidInput);
+
+        let directory_error = read_bounded(directory.path(), MAX_PACK_BYTES).unwrap_err();
+        assert_eq!(directory_error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn bounded_reader_accepts_symlinks_to_regular_files() {
+        let directory = TempDirectory::create();
+        let target_path = directory.path().join("pack.json");
+        let symlink_path = directory.path().join("pack-link.json");
+        fs::write(&target_path, b"pack bytes").unwrap();
+        symlink(&target_path, &symlink_path).unwrap();
+
+        assert_eq!(read_bounded(&symlink_path, 10).unwrap(), b"pack bytes");
+    }
+
+    #[test]
+    fn bounded_reader_rejects_oversized_regular_files() {
+        let directory = TempDirectory::create();
+        let path = directory.path().join("pack.json");
+        fs::write(&path, b"too large").unwrap();
+
+        let error = read_bounded(&path, 8).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
     }
 
     #[test]

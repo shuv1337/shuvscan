@@ -1,7 +1,4 @@
-use std::{
-    io::{self, Write},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::io::{self, Write};
 
 use serde_json::{Value, json};
 
@@ -52,10 +49,16 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
             )?;
         }
         writeln!(writer, "{}", "-".repeat(72))?;
-        if report.findings.is_empty() {
+        if report.findings.is_empty() && report.errors.is_empty() {
             writeln!(
                 writer,
                 "PASS  No findings detected by the active probe pack."
+            )?;
+        }
+        if !report.errors.is_empty() {
+            writeln!(
+                writer,
+                "INCOMPLETE  Collection errors prevent a complete verdict."
             )?;
         }
         for finding in &report.findings {
@@ -66,6 +69,13 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
                 finding.id,
                 finding.title
             )?;
+            if finding.evidence_truncated {
+                writeln!(
+                    writer,
+                    "         evidence truncated: {} byte(s) omitted ({}-byte limit)",
+                    finding.evidence_omitted_bytes, finding.evidence_limit_bytes
+                )?;
+            }
             if !finding.evidence.output.is_empty() {
                 for line in finding.evidence.output.lines().take(4) {
                     writeln!(writer, "         evidence: {}", terminal_safe(line))?;
@@ -121,13 +131,20 @@ pub fn human(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
 fn terminal_safe(value: &str) -> String {
     let mut safe = String::with_capacity(value.len());
     for character in value.chars() {
-        if character.is_control() {
+        if character.is_control() || is_bidi_control(character) {
             safe.extend(character.escape_default());
         } else {
             safe.push(character);
         }
     }
     safe
+}
+
+fn is_bidi_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}' | '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 pub fn json(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
@@ -137,10 +154,14 @@ pub fn json(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
 
 pub fn jsonl(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
     for report in reports {
-        serde_json::to_writer(&mut writer, report).map_err(io::Error::from)?;
-        writeln!(writer)?;
+        jsonl_report(report, &mut writer)?;
     }
     Ok(())
+}
+
+pub fn jsonl_report(report: &ScanReport, mut writer: impl Write) -> io::Result<()> {
+    serde_json::to_writer(&mut writer, report).map_err(io::Error::from)?;
+    writeln!(writer)
 }
 
 pub fn sarif(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
@@ -187,10 +208,16 @@ pub fn sarif_with_probes(
                         }]
                     }],
                     "properties": {
+                        "scanId": report.scan_id,
+                        "startedAt": report.started_at,
+                        "completedAt": report.completed_at,
                         "target": report.target,
                         "category": finding.category,
                         "severity": finding.severity.to_string(),
                         "evidence": finding.evidence.output,
+                        "evidenceTruncated": finding.evidence_truncated,
+                        "evidenceOmittedBytes": finding.evidence_omitted_bytes,
+                        "evidenceLimitBytes": finding.evidence_limit_bytes,
                         "remediation": finding.remediation
                     }
                 });
@@ -215,6 +242,7 @@ pub fn sarif_with_probes(
                         "text": format!("{}: {}: {}", report.target, error.probe, error.message)
                     },
                     "properties": {
+                        "scanId": report.scan_id,
                         "target": report.target,
                         "probe": error.probe
                     }
@@ -254,11 +282,11 @@ pub fn sarif_with_probes(
             "toolExecutionNotifications": notifications
         }]
     });
-    if let Some(pack) = reports
-        .first()
-        .and_then(|report| report.probe_pack.as_ref())
-    {
-        run["properties"] = json!({ "probePack": pack });
+    if let Some(report) = reports.first() {
+        run["properties"] = json!({ "scanId": report.scan_id });
+        if let Some(pack) = report.probe_pack.as_ref() {
+            run["properties"]["probePack"] = json!(pack);
+        }
     }
     let log = json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
@@ -270,19 +298,10 @@ pub fn sarif_with_probes(
     writeln!(writer)
 }
 
-pub fn ocsf(reports: &[ScanReport], writer: impl Write) -> io::Result<()> {
-    let time = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| io::Error::other(format!("system clock is before Unix epoch: {error}")))?
-        .as_millis();
-    let time = u64::try_from(time)
-        .map_err(|_| io::Error::other("system time does not fit an OCSF timestamp"))?;
-    ocsf_at(reports, time, writer)
-}
-
-fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Result<()> {
+pub fn ocsf(reports: &[ScanReport], mut writer: impl Write) -> io::Result<()> {
     let mut events = Vec::new();
     for report in reports {
+        let time = report.completed_at;
         let collection_failed = report.errors.iter().any(|error| error.probe == "collector");
         let activity_id = if collection_failed { 6 } else { 2 };
         let activity_name = if collection_failed {
@@ -318,6 +337,9 @@ fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Res
             "unmapped": {
                 "shuvscan": {
                     "target": report.target,
+                    "scan_id": report.scan_id,
+                    "started_at": report.started_at,
+                    "completed_at": report.completed_at,
                     "collection_errors": errors
                 }
             }
@@ -349,7 +371,7 @@ fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Res
                     }
                 }],
                 "finding_info": {
-                    "uid": format!("{}:{}", report.target, finding.id),
+                    "uid": format!("{}:{}:{}", report.scan_id, report.target, finding.id),
                     "title": finding.title,
                     "desc": finding.description,
                     "types": [finding.category]
@@ -368,7 +390,11 @@ fn ocsf_at(reports: &[ScanReport], time: u64, mut writer: impl Write) -> io::Res
                 "unmapped": {
                     "shuvscan": {
                         "target": report.target,
-                        "rule_id": finding.id
+                        "scan_id": report.scan_id,
+                        "rule_id": finding.id,
+                        "evidence_truncated": finding.evidence_truncated,
+                        "evidence_omitted_bytes": finding.evidence_omitted_bytes,
+                        "evidence_limit_bytes": finding.evidence_limit_bytes
                     }
                 }
             });
@@ -438,6 +464,9 @@ mod tests {
         ScanReport {
             schema_version: 1,
             scanner_version: "0.1.0-test",
+            scan_id: "scan-fixture".into(),
+            started_at: 1_723_000_000_000,
+            completed_at: 1_723_000_000_042,
             probe_pack: None,
             target: "host.example".into(),
             host: Some(HostInfo {
@@ -459,6 +488,9 @@ mod tests {
                 category: "identity",
                 description: "An account other than root has UID 0.",
                 remediation: "Assign a unique non-zero UID.",
+                evidence_truncated: false,
+                evidence_omitted_bytes: 0,
+                evidence_limit_bytes: 8 * 1024,
                 evidence: Evidence {
                     command: "awk fixture",
                     output: "maintenance:/root:/bin/sh\n".into(),
@@ -514,7 +546,7 @@ mod tests {
                 .len(),
             2
         );
-        assert!(run.get("properties").is_none());
+        assert_eq!(run["properties"]["scanId"], "scan-fixture");
     }
 
     #[test]
@@ -527,6 +559,83 @@ mod tests {
 
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("truncated: true"));
+    }
+
+    #[test]
+    fn human_output_discloses_truncated_findings_before_the_evidence_preview() {
+        let mut report = report();
+        report.findings[0].evidence.output = "one\ntwo\nthree\nfour\n[truncated]".into();
+        report.findings[0].evidence_truncated = true;
+        report.findings[0].evidence_omitted_bytes = 23;
+        let mut output = Vec::new();
+
+        human(&[report], &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        let notice = output.find("evidence truncated:").unwrap();
+        let preview = output.find("evidence: one").unwrap();
+        assert!(notice < preview);
+        assert!(output.contains("evidence truncated: 23 byte(s) omitted (8192-byte limit)"));
+        assert!(!output.contains("[truncated]"));
+    }
+
+    #[test]
+    fn machine_outputs_expose_finding_evidence_completeness() {
+        let mut report = report();
+        report.findings[0].evidence_truncated = true;
+        report.findings[0].evidence_omitted_bytes = 23;
+
+        let mut json_output = Vec::new();
+        json(&[report.clone()], &mut json_output).unwrap();
+        let json_value: Value = serde_json::from_slice(&json_output).unwrap();
+        let native_finding = &json_value[0]["findings"][0];
+        assert_eq!(native_finding["evidence_truncated"], true);
+        assert_eq!(native_finding["evidence_omitted_bytes"], 23);
+        assert_eq!(native_finding["evidence_limit_bytes"], 8 * 1024);
+
+        let mut jsonl_output = Vec::new();
+        jsonl(&[report.clone()], &mut jsonl_output).unwrap();
+        let jsonl_value: Value = serde_json::from_slice(&jsonl_output).unwrap();
+        assert_eq!(jsonl_value["findings"][0]["evidence_truncated"], true);
+
+        let mut sarif_output = Vec::new();
+        sarif(&[report.clone()], &mut sarif_output).unwrap();
+        let sarif_value: Value = serde_json::from_slice(&sarif_output).unwrap();
+        let sarif_properties = &sarif_value["runs"][0]["results"][0]["properties"];
+        assert_eq!(sarif_properties["evidenceTruncated"], true);
+        assert_eq!(sarif_properties["evidenceOmittedBytes"], 23);
+        assert_eq!(sarif_properties["evidenceLimitBytes"], 8 * 1024);
+
+        let mut ocsf_output = Vec::new();
+        ocsf(&[report], &mut ocsf_output).unwrap();
+        let ocsf_value: Value = serde_json::from_slice(&ocsf_output).unwrap();
+        let ocsf_extension = &ocsf_value[1]["unmapped"]["shuvscan"];
+        assert_eq!(ocsf_extension["evidence_truncated"], true);
+        assert_eq!(ocsf_extension["evidence_omitted_bytes"], 23);
+        assert_eq!(ocsf_extension["evidence_limit_bytes"], 8 * 1024);
+    }
+
+    #[test]
+    fn human_output_does_not_flag_complete_finding_evidence() {
+        let mut output = Vec::new();
+
+        human(&[report()], &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains("evidence truncated:"));
+    }
+
+    #[test]
+    fn human_output_never_calls_an_incomplete_scan_a_pass() {
+        let mut report = report();
+        report.findings.clear();
+        let mut output = Vec::new();
+
+        human(&[report], &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("INCOMPLETE"));
+        assert!(!output.contains("PASS"));
     }
 
     #[test]
@@ -544,6 +653,48 @@ mod tests {
         assert!(output.contains(r"finding=\u{1b}[31mred"));
         assert!(output.contains(r"cmd=\u{1b}[2Jclear"));
         assert!(output.contains(r"tools=awk\u{1b}[2J"));
+    }
+
+    #[test]
+    fn human_output_escapes_unicode_bidi_controls() {
+        const BIDI_CONTROLS: [char; 12] = [
+            '\u{061c}', '\u{200e}', '\u{200f}', '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}',
+            '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ];
+
+        for character in BIDI_CONTROLS {
+            let mut report = report();
+            report.target = format!("host{character}.example");
+            report.findings[0].evidence.output = format!("finding={character}spoofed");
+            report.errors[0].message = format!("error={character}spoofed");
+            let mut output = Vec::new();
+
+            human(&[report], &mut output).unwrap();
+
+            let output = String::from_utf8(output).unwrap();
+            let escaped = format!(r"\u{{{:x}}}", u32::from(character));
+            assert!(!output.contains(character));
+            assert!(output.contains(&escaped), "missing escape {escaped}");
+        }
+
+        assert_eq!(terminal_safe("café 東京 👩‍💻"), "café 東京 👩‍💻");
+    }
+
+    #[test]
+    fn json_variants_preserve_unicode_bidi_controls() {
+        let mut report = report();
+        report.target = "host\u{202e}\u{2066}.example".into();
+        let expected = report.target.clone();
+
+        let mut json_output = Vec::new();
+        json(&[report.clone()], &mut json_output).unwrap();
+        let json_value: Value = serde_json::from_slice(&json_output).unwrap();
+        assert_eq!(json_value[0]["target"], expected);
+
+        let mut jsonl_output = Vec::new();
+        jsonl(&[report], &mut jsonl_output).unwrap();
+        let jsonl_value: Value = serde_json::from_slice(&jsonl_output).unwrap();
+        assert_eq!(jsonl_value["target"], expected);
     }
 
     #[test]
@@ -586,9 +737,9 @@ mod tests {
     }
 
     #[test]
-    fn ocsf_emits_scan_and_detection_events_with_fixed_time() {
+    fn ocsf_emits_scan_and_detection_events() {
         let mut output = Vec::new();
-        ocsf_at(&[report()], 1_723_000_000_000, &mut output).unwrap();
+        ocsf(&[report()], &mut output).unwrap();
         let events: Value = serde_json::from_slice(&output).unwrap();
         let events = events.as_array().unwrap();
 
@@ -613,7 +764,7 @@ mod tests {
         assert_eq!(events[1]["severity_id"], 5);
         assert_eq!(events[1]["device"]["hostname"], "fixture-host");
         assert_eq!(events[1]["device"]["type_id"], 0);
-        assert_eq!(events[1]["time"], 1_723_000_000_000_u64);
+        assert_eq!(events[1]["time"], 1_723_000_000_042_u64);
         assert_eq!(events[1]["metadata"]["version"], OCSF_VERSION);
     }
 
@@ -627,7 +778,7 @@ mod tests {
             message: "transport timed out".into(),
         }];
         let mut output = Vec::new();
-        ocsf_at(&[report], 1_723_000_000_000, &mut output).unwrap();
+        ocsf(&[report], &mut output).unwrap();
         let events: Value = serde_json::from_slice(&output).unwrap();
 
         assert_eq!(events[0]["activity_id"], 6);
@@ -635,5 +786,76 @@ mod tests {
         assert_eq!(events[0]["type_uid"], 600706);
         assert_eq!(events[0]["total"], 0);
         assert_eq!(events.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn ocsf_uses_the_recorded_collection_time_and_scan_identity() {
+        let report = report();
+        let expected_time = report.completed_at;
+        let expected_uid = format!(
+            "{}:{}:{}",
+            report.scan_id, report.target, report.findings[0].id
+        );
+        let mut output = Vec::new();
+
+        ocsf(&[report], &mut output).unwrap();
+        let events: Value = serde_json::from_slice(&output).unwrap();
+
+        assert_eq!(events[0]["time"], expected_time);
+        assert_eq!(events[1]["finding_info"]["uid"], expected_uid);
+    }
+
+    #[test]
+    fn native_json_variants_validate_against_the_published_schema() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../docs/report.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+
+        let finding = report();
+        let mut clean = report();
+        clean.findings.clear();
+        clean.observations.clear();
+        clean.errors.clear();
+        let mut failed = clean.clone();
+        failed.host = None;
+        failed.errors.push(ScanError {
+            probe: "collector",
+            message: "fixture transport failure".into(),
+        });
+        let mut signed = clean.clone();
+        signed.probe_pack = Some(ProbePackInfo {
+            schema_version: 1,
+            id: "org.example.baseline".into(),
+            version: "1.0.0".into(),
+            signer: "example-security".into(),
+        });
+
+        for report in [finding, clean, failed, signed] {
+            let value = serde_json::to_value([report]).unwrap();
+            assert!(
+                validator.is_valid(&value),
+                "schema rejected native report: {:?}",
+                validator.iter_errors(&value).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn published_schema_accepts_additive_optional_fields() {
+        let schema: Value =
+            serde_json::from_str(include_str!("../docs/report.schema.json")).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        let mut value = serde_json::to_value([report()]).unwrap();
+        value[0]["future_field"] = json!("added without a schema_version bump");
+        value[0]["findings"][0]["future_field"] = json!(true);
+        value[0]["host"]["capabilities"]["future_field"] = json!(1);
+
+        assert!(
+            validator.is_valid(&value),
+            "schema must tolerate additive fields: {:?}",
+            validator.iter_errors(&value).collect::<Vec<_>>()
+        );
+        value[0]["schema_version"] = json!(2);
+        assert!(!validator.is_valid(&value));
     }
 }

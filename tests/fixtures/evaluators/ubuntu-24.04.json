@@ -2,7 +2,7 @@
   "distro": "ubuntu-24.04",
   "cases": [
     { "probe": "SHUV-AUTH-001", "non_finding": "\n", "finding": "support:/home/support:/bin/bash\n" },
-    { "probe": "SHUV-AUTH-002", "non_finding": "\n", "finding": "permitrootlogin yes\n" },
+    { "probe": "SHUV-AUTH-002", "non_finding": "", "finding": "permitrootlogin prohibit-password\n" },
     { "probe": "SHUV-AUTH-003", "non_finding": "\n", "finding": "passwordauthentication yes\n" },
     { "probe": "SHUV-PERSIST-001", "non_finding": "\n", "finding": "/usr/lib/x86_64-linux-gnu/libmonitor.so\n" },
     { "probe": "SHUV-PERSIST-002", "non_finding": "\n", "finding": "/etc/cron.daily/telemetry\n" },
