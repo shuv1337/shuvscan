@@ -304,7 +304,9 @@ Releases are cut by pushing a `v*` tag that matches the `version` in `Cargo.toml
 for `x86_64` and `aarch64` Linux, smoke-tests `--version`, packages each as
 `shuvscan-vX.Y.Z-<target>.tar.gz` with `LICENSE`, `README.md`, and `SECURITY.md`, verifies
 per-artifact SHA-256 checksums, and publishes a GitHub release with a combined `SHA256SUMS` and
-auto-generated notes.
+auto-generated notes. After a successful release it calls `.github/workflows/notify-discord.yml`,
+which posts to the `DISCORD_RELEASE_WEBHOOK_URL` repository secret if set and is a no-op otherwise
+(`gh workflow run notify-discord.yml -f version=vX.Y.Z` backfills an announcement by hand).
 
 ```bash
 # After bumping Cargo.toml and landing it on main:

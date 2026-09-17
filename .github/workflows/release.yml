@@ -79,3 +79,11 @@ jobs:
             --verify-tag \
             --title "shuvscan ${GITHUB_REF_NAME}" \
             --generate-notes
+
+  notify-discord:
+    needs: release
+    if: success() && github.repository == 'shuv1337/shuvscan'
+    uses: ./.github/workflows/notify-discord.yml
+    with:
+      version: ${{ github.ref_name }}
+    secrets: inherit
