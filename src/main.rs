@@ -1,19 +1,20 @@
 use std::{
     ffi::OsString,
-    io,
+    fs,
+    io::{self, Write},
     num::{NonZeroU64, NonZeroUsize},
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode, Stdio},
     time::Duration,
 };
 
 use clap::{Parser, ValueEnum};
 use shuvscan::{
     engine,
-    model::{Severity, Target},
+    model::{ScanReport, Severity, Target},
     output, packs,
-    probes::BUILTINS,
-    transport,
+    probes::{BUILTINS, Probe},
+    transport, tui,
 };
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -23,6 +24,8 @@ enum Format {
     Jsonl,
     Sarif,
     Ocsf,
+    Html,
+    Tui,
 }
 
 /// Exit codes: 0 clean, 1 findings at or above --fail-on,
@@ -37,6 +40,14 @@ struct Cli {
     /// Output contract. Machine-readable formats write only data to stdout.
     #[arg(short, long, value_enum, default_value_t = Format::Human)]
     format: Format,
+
+    /// Write the report to PATH instead of stdout. Not valid with --format tui.
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Open the HTML report with xdg-open after writing.
+    #[arg(long, requires = "output")]
+    open: bool,
 
     /// Return exit 1 when this severity or higher is found.
     #[arg(long, default_value = "high")]
@@ -82,8 +93,22 @@ struct Cli {
 fn main() -> ExitCode {
     transport::forward_interrupts_to_collectors();
     let cli = Cli::parse();
+    if matches!(cli.format, Format::Tui) {
+        if cli.output.is_some() {
+            eprintln!("shuvscan: --format tui does not support --output");
+            return ExitCode::from(2);
+        }
+        if cli.unordered {
+            eprintln!("shuvscan: --format tui does not support --unordered");
+            return ExitCode::from(2);
+        }
+    }
     if cli.unordered && !matches!(cli.format, Format::Jsonl) {
         eprintln!("shuvscan: --unordered requires --format jsonl");
+        return ExitCode::from(2);
+    }
+    if cli.open && !matches!(cli.format, Format::Html) {
+        eprintln!("shuvscan: --open requires --format html");
         return ExitCode::from(2);
     }
     let verified_pack = match (&cli.probe_pack, &cli.probe_pack_key) {
@@ -121,9 +146,22 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let stdout = io::stdout();
+    if matches!(cli.format, Format::Tui) {
+        if let Err(error) = tui::ensure_interactive() {
+            eprintln!("shuvscan: {error}");
+            return ExitCode::from(2);
+        }
+    }
+
+    let mut writer = match report_writer(cli.output.as_deref(), cli.format) {
+        Ok(writer) => writer,
+        Err(error) => {
+            eprintln!("shuvscan: could not write report: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
     if cli.unordered {
-        let mut writer = stdout.lock();
         let streamed = engine::scan_all_unordered_with_probes(
             cli.target,
             Duration::from_secs(cli.timeout.get()),
@@ -133,6 +171,12 @@ fn main() -> ExitCode {
             probe_pack,
             |report| output::jsonl_report(report, &mut writer),
         );
+        if let Err(error) = flush_writer(&mut writer) {
+            if error.kind() != io::ErrorKind::BrokenPipe {
+                eprintln!("shuvscan: could not write report: {error}");
+                return ExitCode::from(2);
+            }
+        }
         return streamed_exit(streamed, cli.strict_collection, cli.fail_on);
     }
 
@@ -145,14 +189,20 @@ fn main() -> ExitCode {
         probes,
         probe_pack,
     );
-    let result = match cli.format {
-        Format::Human => output::human(&reports, stdout.lock()),
-        Format::Json => output::json(&reports, stdout.lock()),
-        Format::Jsonl => output::jsonl(&reports, stdout.lock()),
-        Format::Sarif => output::sarif_with_probes(&reports, probes, stdout.lock()),
-        Format::Ocsf => output::ocsf(&reports, stdout.lock()),
-    };
-    if let Err(error) = result {
+    if matches!(cli.format, Format::Tui) {
+        if let Err(error) = tui::run(&reports) {
+            eprintln!("shuvscan: {error}");
+            return ExitCode::from(2);
+        }
+        let mut summary = engine::ScanSummary::for_targets(targets_requested);
+        for report in &reports {
+            summary.include(report);
+        }
+        return report_exit(summary, cli.strict_collection, cli.fail_on);
+    }
+
+    let result = write_reports(cli.format, &reports, probes, &mut writer);
+    if let Err(error) = result.and_then(|()| flush_writer(&mut writer)) {
         // A consumer closing the pipe early (`shuvscan | head`) is not a
         // scanner failure; still return the severity-based exit code below.
         if error.kind() != io::ErrorKind::BrokenPipe {
@@ -160,11 +210,67 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     }
+    drop(writer);
+    if cli.open {
+        if let Some(path) = &cli.output {
+            open_html_report(path);
+        }
+    }
     let mut summary = engine::ScanSummary::for_targets(targets_requested);
     for report in &reports {
         summary.include(report);
     }
     report_exit(summary, cli.strict_collection, cli.fail_on)
+}
+
+fn report_writer(path: Option<&Path>, format: Format) -> io::Result<Box<dyn Write>> {
+    if matches!(format, Format::Tui) {
+        return Ok(Box::new(io::sink()));
+    }
+    match path {
+        Some(path) => Ok(Box::new(io::BufWriter::new(fs::File::create(path)?))),
+        None => Ok(Box::new(io::stdout())),
+    }
+}
+
+fn write_reports(
+    format: Format,
+    reports: &[ScanReport],
+    probes: &[Probe],
+    writer: &mut dyn Write,
+) -> io::Result<()> {
+    match format {
+        Format::Human => output::human(reports, writer),
+        Format::Json => output::json(reports, writer),
+        Format::Jsonl => output::jsonl(reports, writer),
+        Format::Sarif => output::sarif_with_probes(reports, probes, writer),
+        Format::Ocsf => output::ocsf(reports, writer),
+        Format::Html => output::html(reports, writer),
+        Format::Tui => Ok(()),
+    }
+}
+
+fn flush_writer(writer: &mut dyn Write) -> io::Result<()> {
+    writer.flush()
+}
+
+fn open_html_report(path: &Path) {
+    let absolute = match path.canonicalize() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("shuvscan: could not open report: {error}");
+            return;
+        }
+    };
+    if let Err(error) = Command::new("xdg-open")
+        .arg(&absolute)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        eprintln!("shuvscan: could not open report: {error}");
+    }
 }
 
 fn streamed_exit(

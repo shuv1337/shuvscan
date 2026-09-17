@@ -120,6 +120,75 @@ fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+struct TempReport {
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+impl TempReport {
+    fn html() -> Self {
+        let id = TEMP_PACK_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("shuvscan-cli-out-{}-{id}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("report.html");
+        Self { directory, path }
+    }
+}
+
+impl Drop for TempReport {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+struct StubXdgOpen {
+    directory: PathBuf,
+}
+
+impl StubXdgOpen {
+    fn new() -> Self {
+        let id = TEMP_PACK_ID.fetch_add(1, Ordering::Relaxed);
+        let directory =
+            std::env::temp_dir().join(format!("shuvscan-cli-xdg-{}-{id}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("xdg-open");
+        fs::write(
+            &path,
+            "#!/bin/sh\nprintf '%s' \"$1\" > \"$(dirname \"$0\")/opened\"\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+        Self { directory }
+    }
+
+    fn path_with(&self, rest: &str) -> String {
+        format!("{}:{rest}", self.directory.display())
+    }
+
+    fn wait_for_open(&self) -> PathBuf {
+        let log = self.directory.join("opened");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = fs::read_to_string(&log) {
+                if !text.is_empty() {
+                    return PathBuf::from(text);
+                }
+            }
+            assert!(Instant::now() < deadline, "xdg-open stub was never invoked");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for StubXdgOpen {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
 #[test]
 fn help_describes_agentless_targets() {
     Command::cargo_bin("shuvscan")
@@ -130,7 +199,11 @@ fn help_describes_agentless_targets() {
         .stdout(predicate::str::contains("OpenSSH destination"))
         .stdout(predicate::str::contains("--concurrency"))
         .stdout(predicate::str::contains("--sudo"))
-        .stdout(predicate::str::contains("sudo -n"));
+        .stdout(predicate::str::contains("sudo -n"))
+        .stdout(predicate::str::contains("--output"))
+        .stdout(predicate::str::contains("--open"))
+        .stdout(predicate::str::contains("html"))
+        .stdout(predicate::str::contains("tui"));
 }
 
 #[test]
@@ -379,4 +452,111 @@ fn tampered_probe_pack_is_rejected_before_scanning() {
         .code(2)
         .stdout(predicate::str::is_empty())
         .stderr(predicate::str::contains("signature verification failed"));
+}
+
+#[test]
+fn html_report_writes_to_output_and_keeps_stdout_empty() {
+    let ssh = StubSsh::failing();
+    let report = TempReport::html();
+    Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args(["--target", "fixture-host", "--format", "html", "--output"])
+        .arg(&report.path)
+        .env("PATH", ssh.path())
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty());
+
+    let html = fs::read_to_string(&report.path).unwrap();
+    assert!(html.contains("<!DOCTYPE html>"));
+    assert!(html.contains("Content-Security-Policy"));
+    assert!(html.contains("INCOMPLETE"));
+    assert!(!html.contains("class=\"verdict pass\""));
+}
+
+#[test]
+fn tui_rejects_non_interactive_stdio() {
+    Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args(["--format", "tui"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("interactive terminal"));
+}
+
+#[test]
+fn tui_rejects_output() {
+    Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args(["--format", "tui", "--output", "report.html"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "--format tui does not support --output",
+        ));
+}
+
+#[test]
+fn tui_rejects_unordered() {
+    Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args(["--format", "tui", "--unordered"])
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains(
+            "--format tui does not support --unordered",
+        ));
+}
+
+#[test]
+fn open_requires_output() {
+    Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args(["--format", "html", "--open"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("--output"));
+}
+
+#[test]
+fn open_requires_html() {
+    let report = TempReport::html();
+    Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args(["--format", "json", "--open", "--output"])
+        .arg(&report.path)
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("--open requires --format html"));
+}
+
+#[test]
+fn open_spawns_xdg_open_without_waiting() {
+    let ssh = StubSsh::failing();
+    let xdg = StubXdgOpen::new();
+    let report = TempReport::html();
+    Command::cargo_bin("shuvscan")
+        .unwrap()
+        .args([
+            "--target",
+            "fixture-host",
+            "--format",
+            "html",
+            "--open",
+            "--output",
+        ])
+        .arg(&report.path)
+        .env("PATH", xdg.path_with(&ssh.path()))
+        .assert()
+        .code(2)
+        .stdout(predicate::str::is_empty());
+
+    let opened = xdg.wait_for_open();
+    assert_eq!(opened, report.path.canonicalize().unwrap());
+    let html = fs::read_to_string(&report.path).unwrap();
+    assert!(html.contains("<!DOCTYPE html>"));
 }

@@ -22,7 +22,7 @@
 
 - SQLite evidence store with retention controls
 - Resumable scheduler, bastions, host groups, and rate limits
-- Keyboard-driven TUI and standalone HTML reports
+- [x] Keyboard-driven TUI and standalone HTML reports
 - Case bundles with cryptographic manifests
 
 ## Phase 4: Ecosystem
